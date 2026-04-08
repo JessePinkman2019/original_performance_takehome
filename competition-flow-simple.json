@@ -1,0 +1,64 @@
+{
+  "version": 2,
+  "nodes": [
+    {
+      "type": "frame",
+      "id": "root",
+      "x": 0, "y": 0,
+      "width": 1200,
+      "height": "fit-content",
+      "layout": "vertical",
+      "gap": 20,
+      "padding": 24,
+      "children": [
+        { "type": "text", "id": "title", "width": "fill-container", "height": "fit-content", "text": "Agent 竞赛全流程", "fontSize": 24, "textAlign": "center", "bold": true },
+        {
+          "type": "frame", "id": "r1",
+          "width": "fill-container", "height": "fit-content",
+          "layout": "horizontal", "gap": 8, "padding": 16,
+          "borderWidth": 2, "borderRadius": 8, "borderColor": "#5178C6", "fillColor": "#F0F4FC",
+          "alignItems": "stretch",
+          "children": [
+            { "type": "rect", "id": "r1a", "width": "fill-container", "height": "fit-content", "text": "A\n2,044", "borderRadius": 8, "borderWidth": 2, "borderColor": "#5178C6", "fillColor": "#FFFFFF", "fontSize": 14, "textAlign": "center" },
+            { "type": "rect", "id": "r1b", "width": "fill-container", "height": "fit-content", "text": "B ★\n2,383", "borderRadius": 8, "borderWidth": 2, "borderColor": "#5178C6", "fillColor": "#FFFFFF", "fontSize": 14, "textAlign": "center" },
+            { "type": "rect", "id": "r1c", "width": "fill-container", "height": "fit-content", "text": "C\n1,994", "borderRadius": 8, "borderWidth": 2, "borderColor": "#5178C6", "fillColor": "#FFFFFF", "fontSize": 14, "textAlign": "center" },
+            { "type": "rect", "id": "r1d", "width": "fill-container", "height": "fit-content", "text": "D 🏆\n1,820", "borderRadius": 8, "borderWidth": 2, "borderColor": "#2B5BA8", "fillColor": "#D6E4F7", "fontSize": 14, "textAlign": "center", "bold": true }
+          ]
+        },
+        { "type": "text", "id": "r1-note", "width": "fill-container", "height": "fit-content", "text": "Round 1  探索竞赛 → D 赢 merge | B 的 ALU 技术记入融合", "fontSize": 13, "textAlign": "center", "textColor": "#5178C6" },
+        {
+          "type": "frame", "id": "r2",
+          "width": "fill-container", "height": "fit-content",
+          "layout": "horizontal", "gap": 8, "padding": 16,
+          "borderWidth": 2, "borderRadius": 8, "borderColor": "#8569CB", "fillColor": "#EAE2FE",
+          "alignItems": "stretch",
+          "children": [
+            { "type": "rect", "id": "r2e", "width": "fill-container", "height": "fit-content", "text": "E ❌\n3,239", "borderRadius": 8, "borderWidth": 2, "borderColor": "#D25D5A", "fillColor": "#FEE3E2", "fontSize": 14, "textAlign": "center" },
+            { "type": "rect", "id": "r2f", "width": "fill-container", "height": "fit-content", "text": "F 🏆\n1,811", "borderRadius": 8, "borderWidth": 2, "borderColor": "#6B4DAB", "fillColor": "#DDD0F7", "fontSize": 14, "textAlign": "center", "bold": true },
+            { "type": "rect", "id": "r2g", "width": "fill-container", "height": "fit-content", "text": "G\n1,816", "borderRadius": 8, "borderWidth": 2, "borderColor": "#8569CB", "fillColor": "#FFFFFF", "fontSize": 14, "textAlign": "center" },
+            { "type": "rect", "id": "r2h", "width": "fill-container", "height": "fit-content", "text": "H ❌\n2,669", "borderRadius": 8, "borderWidth": 2, "borderColor": "#D25D5A", "fillColor": "#FEE3E2", "fontSize": 14, "textAlign": "center" }
+          ]
+        },
+        { "type": "text", "id": "r2-note", "width": "fill-container", "height": "fit-content", "text": "Round 2  融合竞赛 → F 赢 | 教训：targeted fix >> 重写", "fontSize": 13, "textAlign": "center", "textColor": "#8569CB" },
+        {
+          "type": "frame", "id": "r3",
+          "width": "fill-container", "height": "fit-content",
+          "layout": "horizontal", "gap": 8, "padding": 16,
+          "borderWidth": 2, "borderRadius": 8, "borderColor": "#D4B45B", "fillColor": "#FEF1CE",
+          "alignItems": "stretch",
+          "children": [
+            { "type": "rect", "id": "r3i", "width": "fill-container", "height": "fit-content", "text": "I\n1,714", "borderRadius": 8, "borderWidth": 2, "borderColor": "#D4B45B", "fillColor": "#FFFFFF", "fontSize": 14, "textAlign": "center" },
+            { "type": "rect", "id": "r3j", "width": "fill-container", "height": "fit-content", "text": "J\n1,787", "borderRadius": 8, "borderWidth": 2, "borderColor": "#D4B45B", "fillColor": "#FFFFFF", "fontSize": 14, "textAlign": "center" },
+            { "type": "rect", "id": "r3k", "width": "fill-container", "height": "fit-content", "text": "K\n1,503", "borderRadius": 8, "borderWidth": 2, "borderColor": "#D4B45B", "fillColor": "#FFFFFF", "fontSize": 14, "textAlign": "center" },
+            { "type": "rect", "id": "r3l", "width": "fill-container", "height": "fit-content", "text": "L 🏆\n1,391", "borderRadius": 8, "borderWidth": 2, "borderColor": "#B8860B", "fillColor": "#FFEDB3", "fontSize": 14, "textAlign": "center", "bold": true }
+          ]
+        },
+        { "type": "text", "id": "r3-note", "width": "fill-container", "height": "fit-content", "text": "Round 3  严格流程 → L 赢 | 三引擎 89%+ | 🎯 目标达成", "fontSize": 13, "textAlign": "center", "textColor": "#B8860B" },
+        { "type": "rect", "id": "final", "width": "fill-container", "height": "fit-content", "text": "🎯 1,391 cycles | 106.2x | 8/9 通过 | 超越 Opus 4.5", "borderRadius": 12, "borderWidth": 3, "borderColor": "#509863", "fillColor": "#DFF5E5", "fontSize": 16, "textAlign": "center", "bold": true }
+      ]
+    },
+    { "type": "connector", "connector": { "from": "r1d", "to": "r2f", "fromAnchor": "bottom", "toAnchor": "top", "lineShape": "straight", "lineWidth": 2, "lineColor": "#BBBFC4", "endArrow": "arrow" } },
+    { "type": "connector", "connector": { "from": "r1b", "to": "r2f", "fromAnchor": "bottom", "toAnchor": "top", "lineShape": "rightAngle", "lineWidth": 2, "lineColor": "#5178C6", "endArrow": "arrow" } },
+    { "type": "connector", "connector": { "from": "r2f", "to": "r3l", "fromAnchor": "bottom", "toAnchor": "top", "lineShape": "straight", "lineWidth": 2, "lineColor": "#BBBFC4", "endArrow": "arrow" } }
+  ]
+}

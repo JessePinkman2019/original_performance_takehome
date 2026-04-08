@@ -1,0 +1,248 @@
+{
+  "version": 2,
+  "nodes": [
+    {
+      "type": "frame",
+      "id": "root",
+      "x": 0, "y": 0,
+      "width": 1300,
+      "height": "fit-content",
+      "layout": "vertical",
+      "gap": 20,
+      "padding": 28,
+      "children": [
+        {
+          "type": "text",
+          "id": "title",
+          "width": "fill-container",
+          "height": "fit-content",
+          "text": "Harness-Driven 自主优化架构",
+          "fontSize": 26,
+          "textAlign": "center",
+          "verticalAlign": "middle",
+          "bold": true
+        },
+        {
+          "type": "text",
+          "id": "subtitle",
+          "width": "fill-container",
+          "height": "fit-content",
+          "text": "Ralph Loop: while cycles > 1487: optimize()",
+          "fontSize": 16,
+          "textAlign": "center",
+          "verticalAlign": "middle",
+          "textColor": "#666666"
+        },
+        {
+          "type": "frame",
+          "id": "row-planner",
+          "width": "fill-container",
+          "height": "fit-content",
+          "layout": "horizontal",
+          "gap": 24,
+          "padding": 0,
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "text",
+              "id": "label-plan",
+              "width": 80,
+              "height": "fit-content",
+              "text": "规划层",
+              "fontSize": 18,
+              "textAlign": "right",
+              "bold": true
+            },
+            {
+              "type": "frame",
+              "id": "planner-layer",
+              "width": "fill-container",
+              "height": "fit-content",
+              "borderWidth": 2,
+              "borderRadius": 8,
+              "borderColor": "#5178C6",
+              "fillColor": "#F0F4FC",
+              "layout": "horizontal",
+              "gap": 16,
+              "padding": 24,
+              "alignItems": "stretch",
+              "children": [
+                { "type": "rect", "id": "planner", "width": "fill-container", "height": "fit-content", "text": "🧠 规划器 Agent\n读 PERF_REPORT + CHANGELOG\n写 ROUND_PLAN.md", "borderRadius": 8, "borderWidth": 2, "borderColor": "#5178C6", "fillColor": "#FFFFFF", "fontSize": 14, "textAlign": "center", "verticalAlign": "middle" },
+                { "type": "rect", "id": "explorer", "width": "fill-container", "height": "fit-content", "text": "🔍 探索器 Agent (按需)\n调查 VM 指令集边界\n写 EXPLORATION_FINDINGS.md", "borderRadius": 8, "borderWidth": 2, "borderColor": "#5178C6", "fillColor": "#FFFFFF", "fontSize": 14, "textAlign": "center", "verticalAlign": "middle" }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "row-gen",
+          "width": "fill-container",
+          "height": "fit-content",
+          "layout": "horizontal",
+          "gap": 24,
+          "padding": 0,
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "text",
+              "id": "label-gen",
+              "width": 80,
+              "height": "fit-content",
+              "text": "生成层",
+              "fontSize": 18,
+              "textAlign": "right",
+              "bold": true
+            },
+            {
+              "type": "frame",
+              "id": "gen-layer",
+              "width": "fill-container",
+              "height": "fit-content",
+              "borderWidth": 2,
+              "borderRadius": 8,
+              "borderColor": "#8569CB",
+              "fillColor": "#EAE2FE",
+              "layout": "horizontal",
+              "gap": 12,
+              "padding": 24,
+              "alignItems": "stretch",
+              "children": [
+                { "type": "rect", "id": "gen-1", "width": "fill-container", "height": "fit-content", "text": "⚙️ 生成器 1\nWorktree A\n策略: 保守修复", "borderRadius": 8, "borderWidth": 2, "borderColor": "#8569CB", "fillColor": "#FFFFFF", "fontSize": 13, "textAlign": "center", "verticalAlign": "middle" },
+                { "type": "rect", "id": "gen-2", "width": "fill-container", "height": "fit-content", "text": "⚙️ 生成器 2\nWorktree B\n策略: ALU融合", "borderRadius": 8, "borderWidth": 2, "borderColor": "#8569CB", "fillColor": "#FFFFFF", "fontSize": 13, "textAlign": "center", "verticalAlign": "middle" },
+                { "type": "rect", "id": "gen-3", "width": "fill-container", "height": "fit-content", "text": "⚙️ 生成器 3\nWorktree C\n策略: 缓存扩展", "borderRadius": 8, "borderWidth": 2, "borderColor": "#8569CB", "fillColor": "#FFFFFF", "fontSize": 13, "textAlign": "center", "verticalAlign": "middle" },
+                { "type": "rect", "id": "gen-4", "width": "fill-container", "height": "fit-content", "text": "⚙️ 生成器 4\nWorktree D\n策略: 调度优化", "borderRadius": 8, "borderWidth": 2, "borderColor": "#8569CB", "fillColor": "#FFFFFF", "fontSize": 13, "textAlign": "center", "verticalAlign": "middle" }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "row-eval",
+          "width": "fill-container",
+          "height": "fit-content",
+          "layout": "horizontal",
+          "gap": 24,
+          "padding": 0,
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "text",
+              "id": "label-eval",
+              "width": 80,
+              "height": "fit-content",
+              "text": "评估层",
+              "fontSize": 18,
+              "textAlign": "right",
+              "bold": true
+            },
+            {
+              "type": "frame",
+              "id": "eval-layer",
+              "width": "fill-container",
+              "height": "fit-content",
+              "borderWidth": 2,
+              "borderRadius": 8,
+              "borderColor": "#D25D5A",
+              "fillColor": "#FEE3E2",
+              "layout": "horizontal",
+              "gap": 16,
+              "padding": 24,
+              "alignItems": "stretch",
+              "children": [
+                { "type": "rect", "id": "perf-agent", "width": "fill-container", "height": "fit-content", "text": "📊 Perf Agent（评估器）\n对全部 4 个 Worktree 做完整 Trace 分析\nsubmission_tests → trace.json → 引擎利用率\n写 PERF_REPORT.md", "borderRadius": 8, "borderWidth": 2, "borderColor": "#D25D5A", "fillColor": "#FFFFFF", "fontSize": 14, "textAlign": "center", "verticalAlign": "middle" }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "row-persist",
+          "width": "fill-container",
+          "height": "fit-content",
+          "layout": "horizontal",
+          "gap": 24,
+          "padding": 0,
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "text",
+              "id": "label-persist",
+              "width": 80,
+              "height": "fit-content",
+              "text": "持久层",
+              "fontSize": 18,
+              "textAlign": "right",
+              "bold": true
+            },
+            {
+              "type": "frame",
+              "id": "persist-layer",
+              "width": "fill-container",
+              "height": "fit-content",
+              "borderWidth": 2,
+              "borderRadius": 8,
+              "borderColor": "#509863",
+              "fillColor": "#DFF5E5",
+              "layout": "horizontal",
+              "gap": 12,
+              "padding": 24,
+              "alignItems": "stretch",
+              "children": [
+                { "type": "rect", "id": "changelog", "width": "fill-container", "height": "fit-content", "text": "📝 CHANGELOG.md\n持久记忆\n成功+失败+Trace数据", "borderRadius": 8, "borderWidth": 2, "borderColor": "#509863", "fillColor": "#FFFFFF", "fontSize": 13, "textAlign": "center", "verticalAlign": "middle" },
+                { "type": "rect", "id": "perf-report", "width": "fill-container", "height": "fit-content", "text": "📊 PERF_REPORT.md\n全量引擎利用率\n4 Agent 对比表", "borderRadius": 8, "borderWidth": 2, "borderColor": "#509863", "fillColor": "#FFFFFF", "fontSize": 13, "textAlign": "center", "verticalAlign": "middle" },
+                { "type": "rect", "id": "round-plan", "width": "fill-container", "height": "fit-content", "text": "📋 ROUND_PLAN.md\n融合策略\n4 个生成器方向", "borderRadius": 8, "borderWidth": 2, "borderColor": "#509863", "fillColor": "#FFFFFF", "fontSize": 13, "textAlign": "center", "verticalAlign": "middle" },
+                { "type": "rect", "id": "git-log", "width": "fill-container", "height": "fit-content", "text": "🔀 Git\n每轮一个 Commit\nmain 只接受验证通过的", "borderRadius": 8, "borderWidth": 2, "borderColor": "#509863", "fillColor": "#FFFFFF", "fontSize": 13, "textAlign": "center", "verticalAlign": "middle" }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "id": "row-dream",
+          "width": "fill-container",
+          "height": "fit-content",
+          "layout": "horizontal",
+          "gap": 24,
+          "padding": 0,
+          "alignItems": "center",
+          "children": [
+            {
+              "type": "text",
+              "id": "label-dream",
+              "width": 80,
+              "height": "fit-content",
+              "text": "熵管理",
+              "fontSize": 18,
+              "textAlign": "right",
+              "bold": true
+            },
+            {
+              "type": "frame",
+              "id": "dream-layer",
+              "width": "fill-container",
+              "height": "fit-content",
+              "borderWidth": 2,
+              "borderRadius": 8,
+              "borderColor": "#D4B45B",
+              "fillColor": "#FEF1CE",
+              "layout": "horizontal",
+              "gap": 16,
+              "padding": 24,
+              "alignItems": "stretch",
+              "children": [
+                { "type": "rect", "id": "dream-tactic", "width": "fill-container", "height": "fit-content", "text": "🌙 战术层做梦\n失败模式扫描\n假设审计\nCHANGELOG 清理", "borderRadius": 8, "borderWidth": 2, "borderColor": "#D4B45B", "fillColor": "#FFFFFF", "fontSize": 13, "textAlign": "center", "verticalAlign": "middle" },
+                { "type": "rect", "id": "dream-strategic", "width": "fill-container", "height": "fit-content", "text": "🌙 战略层做梦 (Auto Dream)\nPhase 1: Orient\nPhase 2: Gather Signal\nPhase 3: Consolidate\nPhase 4: Prune & Index", "borderRadius": 8, "borderWidth": 2, "borderColor": "#D4B45B", "fillColor": "#FFFFFF", "fontSize": 13, "textAlign": "center", "verticalAlign": "middle" },
+                { "type": "rect", "id": "memory", "width": "fill-container", "height": "fit-content", "text": "🧠 Memory 文件\nMEMORY.md (< 200行)\nproject_optimization_state.md\ninsight_engine_bottleneck.md", "borderRadius": 8, "borderWidth": 2, "borderColor": "#D4B45B", "fillColor": "#FFFFFF", "fontSize": 13, "textAlign": "center", "verticalAlign": "middle" }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    { "type": "connector", "connector": { "from": "planner", "to": "gen-1", "fromAnchor": "bottom", "toAnchor": "top", "lineShape": "rightAngle", "lineWidth": 2, "lineColor": "#BBBFC4", "endArrow": "arrow" } },
+    { "type": "connector", "connector": { "from": "planner", "to": "gen-4", "fromAnchor": "bottom", "toAnchor": "top", "lineShape": "rightAngle", "lineWidth": 2, "lineColor": "#BBBFC4", "endArrow": "arrow" } },
+    { "type": "connector", "connector": { "from": "gen-2", "to": "perf-agent", "fromAnchor": "bottom", "toAnchor": "top", "lineShape": "rightAngle", "lineWidth": 2, "lineColor": "#BBBFC4", "endArrow": "arrow" } },
+    { "type": "connector", "connector": { "from": "perf-agent", "to": "perf-report", "fromAnchor": "bottom", "toAnchor": "top", "lineShape": "rightAngle", "lineWidth": 2, "lineColor": "#BBBFC4", "endArrow": "arrow" } },
+    { "type": "connector", "connector": { "from": "perf-report", "to": "planner", "fromAnchor": "left", "toAnchor": "left", "lineShape": "rightAngle", "lineWidth": 2, "lineColor": "#BBBFC4", "endArrow": "arrow" } }
+  ]
+}

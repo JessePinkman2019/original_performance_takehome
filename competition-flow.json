@@ -1,0 +1,142 @@
+{
+  "version": 2,
+  "nodes": [
+    {
+      "type": "frame",
+      "id": "root",
+      "x": 0, "y": 0,
+      "width": 1400,
+      "height": "fit-content",
+      "layout": "vertical",
+      "gap": 16,
+      "padding": 28,
+      "children": [
+        {
+          "type": "text", "id": "title",
+          "width": "fill-container", "height": "fit-content",
+          "text": "Agent 竞赛全流程：147,734 → 1,391 cycles",
+          "fontSize": 24, "textAlign": "center", "bold": true
+        },
+        {
+          "type": "frame", "id": "phase1-row",
+          "width": "fill-container", "height": "fit-content",
+          "layout": "horizontal", "gap": 12, "padding": 16,
+          "borderWidth": 2, "borderRadius": 8,
+          "borderColor": "#509863", "fillColor": "#DFF5E5",
+          "alignItems": "center",
+          "children": [
+            { "type": "text", "id": "p1-label", "width": 120, "height": "fit-content", "text": "Phase 0-1\n基础优化", "fontSize": 14, "textAlign": "center", "bold": true },
+            { "type": "rect", "id": "p0", "width": 160, "height": "fit-content", "text": "VLIW 打包\n98,583", "borderRadius": 8, "borderWidth": 2, "borderColor": "#509863", "fillColor": "#FFFFFF", "fontSize": 13, "textAlign": "center" },
+            { "type": "text", "id": "arrow-p01", "width": 40, "height": "fit-content", "text": "→", "fontSize": 20, "textAlign": "center" },
+            { "type": "rect", "id": "p1", "width": 160, "height": "fit-content", "text": "SIMD 向量化\n9,936", "borderRadius": 8, "borderWidth": 2, "borderColor": "#509863", "fillColor": "#FFFFFF", "fontSize": 13, "textAlign": "center" }
+          ]
+        },
+        {
+          "type": "frame", "id": "r1-row",
+          "width": "fill-container", "height": "fit-content",
+          "layout": "vertical", "gap": 12, "padding": 16,
+          "borderWidth": 2, "borderRadius": 8,
+          "borderColor": "#5178C6", "fillColor": "#F0F4FC",
+          "children": [
+            { "type": "text", "id": "r1-title", "width": "fill-container", "height": "fit-content", "text": "Round 1：4-Way 探索竞赛（9,936 → 1,820）", "fontSize": 16, "bold": true, "textAlign": "left" },
+            {
+              "type": "frame", "id": "r1-agents",
+              "width": "fill-container", "height": "fit-content",
+              "layout": "horizontal", "gap": 8, "padding": 0,
+              "alignItems": "stretch",
+              "children": [
+                { "type": "rect", "id": "r1-a", "width": "fill-container", "height": "fit-content", "text": "Agent A\n列表调度器\n+ broadcast\n2,044", "borderRadius": 8, "borderWidth": 2, "borderColor": "#5178C6", "fillColor": "#FFFFFF", "fontSize": 12, "textAlign": "center" },
+                { "type": "rect", "id": "r1-b", "width": "fill-container", "height": "fit-content", "text": "Agent B\n列表调度器\n+ ALU 地址 ★\n2,383", "borderRadius": 8, "borderWidth": 2, "borderColor": "#5178C6", "fillColor": "#FFFFFF", "fontSize": 12, "textAlign": "center" },
+                { "type": "rect", "id": "r1-c", "width": "fill-container", "height": "fit-content", "text": "Agent C\n列表调度器\n+ 平衡调度\n1,994", "borderRadius": 8, "borderWidth": 2, "borderColor": "#5178C6", "fillColor": "#FFFFFF", "fontSize": 12, "textAlign": "center" },
+                { "type": "rect", "id": "r1-d", "width": "fill-container", "height": "fit-content", "text": "🏆 Agent D\n列表调度器\n+ 树缓存 L0-2\n1,820", "borderRadius": 8, "borderWidth": 2, "borderColor": "#2B5BA8", "fillColor": "#D6E4F7", "fontSize": 12, "textAlign": "center", "bold": true }
+              ]
+            },
+            {
+              "type": "frame", "id": "r1-result",
+              "width": "fill-container", "height": "fit-content",
+              "layout": "horizontal", "gap": 8, "padding": 0,
+              "justifyContent": "center", "alignItems": "center",
+              "children": [
+                { "type": "text", "id": "r1-merge-label", "width": 300, "height": "fit-content", "text": "D 赢 → merge main | B 的 ALU 技术记入融合", "fontSize": 12, "textAlign": "center", "textColor": "#5178C6" }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame", "id": "r2-row",
+          "width": "fill-container", "height": "fit-content",
+          "layout": "vertical", "gap": 12, "padding": 16,
+          "borderWidth": 2, "borderRadius": 8,
+          "borderColor": "#8569CB", "fillColor": "#EAE2FE",
+          "children": [
+            { "type": "text", "id": "r2-title", "width": "fill-container", "height": "fit-content", "text": "Round 2：融合竞赛（1,820 → 1,811）  基于 D 代码 + 融合 A/B/C 技术", "fontSize": 16, "bold": true, "textAlign": "left" },
+            {
+              "type": "frame", "id": "r2-agents",
+              "width": "fill-container", "height": "fit-content",
+              "layout": "horizontal", "gap": 8, "padding": 0,
+              "alignItems": "stretch",
+              "children": [
+                { "type": "rect", "id": "r2-e", "width": "fill-container", "height": "fit-content", "text": "❌ Agent E\n保守修 bug\n(过度重写)\n3,239 退步!", "borderRadius": 8, "borderWidth": 2, "borderColor": "#D25D5A", "fillColor": "#FEE3E2", "fontSize": 12, "textAlign": "center" },
+                { "type": "rect", "id": "r2-f", "width": "fill-container", "height": "fit-content", "text": "🏆 Agent F\nD + bug fix\n+ B的ALU地址\n1,811", "borderRadius": 8, "borderWidth": 2, "borderColor": "#6B4DAB", "fillColor": "#DDD0F7", "fontSize": 12, "textAlign": "center", "bold": true },
+                { "type": "rect", "id": "r2-g", "width": "fill-container", "height": "fit-content", "text": "Agent G\nF + ALU\nhash shift\n1,816", "borderRadius": 8, "borderWidth": 2, "borderColor": "#8569CB", "fillColor": "#FFFFFF", "fontSize": 12, "textAlign": "center" },
+                { "type": "rect", "id": "r2-h", "width": "fill-container", "height": "fit-content", "text": "❌ Agent H\nF + L3 cache\n(过度重写)\n2,669 退步!", "borderRadius": 8, "borderWidth": 2, "borderColor": "#D25D5A", "fillColor": "#FEE3E2", "fontSize": 12, "textAlign": "center" }
+              ]
+            },
+            {
+              "type": "frame", "id": "r2-lesson",
+              "width": "fill-container", "height": "fit-content",
+              "layout": "horizontal", "gap": 8, "padding": 0,
+              "justifyContent": "center", "alignItems": "center",
+              "children": [
+                { "type": "text", "id": "r2-lesson-text", "width": 500, "height": "fit-content", "text": "F 赢 → merge main | 教训：targeted fix >> 全面重写（E/H 退步证明）", "fontSize": 12, "textAlign": "center", "textColor": "#8569CB" }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame", "id": "r3-row",
+          "width": "fill-container", "height": "fit-content",
+          "layout": "vertical", "gap": 12, "padding": 16,
+          "borderWidth": 2, "borderRadius": 8,
+          "borderColor": "#D4B45B", "fillColor": "#FEF1CE",
+          "children": [
+            { "type": "text", "id": "r3-title", "width": "fill-container", "height": "fit-content", "text": "Round 3：严格流程融合竞赛（1,811 → 1,391）  规划器读 PERF_REPORT 决定方向", "fontSize": 16, "bold": true, "textAlign": "left" },
+            {
+              "type": "frame", "id": "r3-agents",
+              "width": "fill-container", "height": "fit-content",
+              "layout": "horizontal", "gap": 8, "padding": 0,
+              "alignItems": "stretch",
+              "children": [
+                { "type": "rect", "id": "r3-i", "width": "fill-container", "height": "fit-content", "text": "Agent I\nBroadcast fix\n+ ALU shift\n1,714", "borderRadius": 8, "borderWidth": 2, "borderColor": "#D4B45B", "fillColor": "#FFFFFF", "fontSize": 12, "textAlign": "center" },
+                { "type": "rect", "id": "r3-j", "width": "fill-container", "height": "fit-content", "text": "Agent J\nBroadcast fix\nonly (安全后备)\n1,787", "borderRadius": 8, "borderWidth": 2, "borderColor": "#D4B45B", "fillColor": "#FFFFFF", "fontSize": 12, "textAlign": "center" },
+                { "type": "rect", "id": "r3-k", "width": "fill-container", "height": "fit-content", "text": "Agent K\nI + 关键路径调度\n+ fused XOR\n1,503", "borderRadius": 8, "borderWidth": 2, "borderColor": "#D4B45B", "fillColor": "#FFFFFF", "fontSize": 12, "textAlign": "center" },
+                { "type": "rect", "id": "r3-l", "width": "fill-container", "height": "fit-content", "text": "🏆 Agent L\nI + 关键路径调度\n+ WAR放松\n+ 全阶段合并\n1,391", "borderRadius": 8, "borderWidth": 2, "borderColor": "#B8860B", "fillColor": "#FFEDB3", "fontSize": 12, "textAlign": "center", "bold": true }
+              ]
+            },
+            {
+              "type": "frame", "id": "r3-result",
+              "width": "fill-container", "height": "fit-content",
+              "layout": "horizontal", "gap": 8, "padding": 0,
+              "justifyContent": "center", "alignItems": "center",
+              "children": [
+                { "type": "text", "id": "r3-result-text", "width": 500, "height": "fit-content", "text": "L 赢 → merge main | 全量 Perf Agent trace 分析 | 三引擎 89%+ 利用率", "fontSize": 12, "textAlign": "center", "textColor": "#B8860B" }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "rect", "id": "final",
+          "width": "fill-container", "height": "fit-content",
+          "text": "🎯 最终结果：1,391 cycles | 106.2x 加速 | 8/9 测试通过 | 超越 Opus 4.5 目标 (1,487)",
+          "borderRadius": 12, "borderWidth": 3, "borderColor": "#509863", "fillColor": "#DFF5E5",
+          "fontSize": 16, "textAlign": "center", "bold": true
+        }
+      ]
+    },
+    { "type": "connector", "connector": { "from": "p1", "to": "r1-agents", "fromAnchor": "bottom", "toAnchor": "top", "lineShape": "straight", "lineWidth": 2, "lineColor": "#BBBFC4", "endArrow": "arrow" } },
+    { "type": "connector", "connector": { "from": "r1-d", "to": "r2-agents", "fromAnchor": "bottom", "toAnchor": "top", "lineShape": "straight", "lineWidth": 2, "lineColor": "#BBBFC4", "endArrow": "arrow" } },
+    { "type": "connector", "connector": { "from": "r1-b", "to": "r2-f", "fromAnchor": "bottom", "toAnchor": "top", "lineShape": "rightAngle", "lineWidth": 2, "lineColor": "#5178C6", "endArrow": "arrow", "dashStyle": "dash" } },
+    { "type": "connector", "connector": { "from": "r2-f", "to": "r3-agents", "fromAnchor": "bottom", "toAnchor": "top", "lineShape": "straight", "lineWidth": 2, "lineColor": "#BBBFC4", "endArrow": "arrow" } },
+    { "type": "connector", "connector": { "from": "r3-l", "to": "final", "fromAnchor": "bottom", "toAnchor": "top", "lineShape": "straight", "lineWidth": 2, "lineColor": "#509863", "endArrow": "arrow" } }
+  ]
+}
