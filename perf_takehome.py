@@ -73,6 +73,15 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
+    def scratch_const_slot(self, val, name=None):
+        """Like scratch_const but returns (slot, addr) for deferred packing.
+        Returns the slot to add, or None if already allocated."""
+        if val not in self.const_map:
+            addr = self.alloc_scratch(name)
+            self.const_map[val] = addr
+            return ("load", ("const", addr, val))
+        return None
+
     def _slot_reads_writes(self, engine, slot):
         """Return (set_of_scratch_reads, set_of_scratch_writes) for a slot."""
         reads = set()
@@ -203,7 +212,7 @@ class KernelBuilder:
                     deps[i].add(last_writer[addr])
 
             # WAR: i writes to addr, and some j < i read from addr
-            # We need to ensure i doesn't execute before those readers
+            # Needed to prevent reordering writers before readers across cycles
             for addr in writes_i:
                 for reader in last_readers.get(addr, set()):
                     deps[i].add(reader)
@@ -222,28 +231,33 @@ class KernelBuilder:
                 last_writer[addr] = i
                 last_readers[addr] = set()  # Reset readers since this write supersedes
 
-        # Compute depth (longest path from a root) for priority
-        depth = [0] * n
-        computed = [False] * n
-
-        def compute_depth(i):
-            if computed[i]:
-                return depth[i]
-            computed[i] = True
-            if deps[i]:
-                depth[i] = max(compute_depth(d) for d in deps[i]) + 1
-            return depth[i]
-
-        for i in range(n):
-            compute_depth(i)
-
-        # List-scheduling: pick ready slots by depth (critical path first)
-        remaining_deps = [set(d) for d in deps]  # Mutable copy
         # Build reverse dep map: successors[i] = set of slots that depend on i
         successors = [set() for _ in range(n)]
         for i in range(n):
             for d in deps[i]:
                 successors[d].add(i)
+
+        # Compute reverse depth (longest path to a sink) for critical-path priority
+        # Use iterative approach to avoid stack overflow
+        depth = [0] * n
+        # Process in reverse topological order: sinks first
+        # A node is a sink if it has no successors
+        remaining_succ_count = [len(successors[i]) for i in range(n)]
+        queue = [i for i in range(n) if remaining_succ_count[i] == 0]
+        while queue:
+            next_queue = []
+            for i in queue:
+                for pred in deps[i]:
+                    d = depth[i] + 1
+                    if d > depth[pred]:
+                        depth[pred] = d
+                    remaining_succ_count[pred] -= 1
+                    if remaining_succ_count[pred] == 0:
+                        next_queue.append(pred)
+            queue = next_queue
+
+        # List-scheduling: pick ready slots by reverse depth (critical path first)
+        remaining_deps = [set(d) for d in deps]  # Mutable copy
 
         ready = set()
         for i in range(n):
@@ -259,7 +273,10 @@ class KernelBuilder:
             bundle_counts = defaultdict(int)
             packed = []
 
-            # Two-pass scheduling: first fill loads (bottleneck), then fill other engines
+            # Two-pass scheduling: loads (bottleneck) first, then all other engines
+            # VLIW: reads happen before writes in the same cycle, so WAR
+            # (writes & bundle_reads) is safe and we only check RAW and WAW.
+            # Priority: reverse depth (critical path), then successor count (fan-out)
             # Pass 1: Pack load slots
             load_ready = [x for x in ready if slots[x][0] == 'load']
             load_ready.sort(key=lambda x: -depth[x])
@@ -271,8 +288,6 @@ class KernelBuilder:
                 if reads & bundle_writes:
                     continue
                 if writes & bundle_writes:
-                    continue
-                if writes & bundle_reads:
                     continue
                 if engine not in bundle:
                     bundle[engine] = []
@@ -302,8 +317,6 @@ class KernelBuilder:
                 if reads & bundle_writes:
                     continue
                 if writes & bundle_writes:
-                    continue
-                if writes & bundle_reads:
                     continue
 
                 if engine not in bundle:
@@ -345,14 +358,32 @@ class KernelBuilder:
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
 
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        # Pre-allocate const_map entries without emitting instructions
+        all_const_vals = [0, 1, 2, 3, 4, 5, 6]
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            all_const_vals.append(val1)
+            all_const_vals.append(val3)
+            if op2 == "+" and op3 == "<<" and op1 == "+":
+                all_const_vals.append(1 + (1 << val3))
+        n_vec_batches_pre = batch_size // VLEN
+        for g in range(min(32, n_vec_batches_pre)):
+            all_const_vals.append(g * VLEN)
 
+        # Just allocate scratch addresses for constants (no instructions yet)
+        seen = set()
+        for val in all_const_vals:
+            if val not in seen and val not in self.const_map:
+                seen.add(val)
+                addr = self.alloc_scratch()
+                self.const_map[val] = addr
+            seen.add(val)
+
+        zero_const = self.const_map[0]
+        one_const = self.const_map[1]
+        two_const = self.const_map[2]
+
+        # First pause (empty first run - matches first yield in reference_kernel2)
         self.add("flow", ("pause",))
 
         # --- Vector scratch allocation ---
@@ -429,30 +460,45 @@ class KernelBuilder:
         fv6_scalar = self.alloc_scratch("fv6_scalar")
         fv6_vec = self.alloc_scratch("fv6_vec", VLEN)
         shared_tmp = self.alloc_scratch("shared_tmp", VLEN)  # Extra temp for round 13
+        four_vec = self.alloc_scratch("four_vec", VLEN)  # Vector of 4s for idx_in_3_6 comparison
 
         fvp_scalar = self.scratch["forest_values_p"]
 
-        # --- Initialization: broadcast vector constants ---
-        init_slots = []
-        init_slots.append(("valu", ("vbroadcast", zero_vec, zero_const)))
-        init_slots.append(("valu", ("vbroadcast", one_vec, one_const)))
-        init_slots.append(("valu", ("vbroadcast", two_vec, two_const)))
-        init_slots.append(("valu", ("vbroadcast", n_nodes_vec, self.scratch["n_nodes"])))
-        three_const = self.scratch_const(3)
+        # --- Merge everything into one packed section for maximum ILP ---
+        all_slots = []
+
+        # Setup: const loads FIRST (they must execute before init var loads)
+        const_emitted = set()
+        for val in all_const_vals:
+            if val not in const_emitted:
+                const_emitted.add(val)
+                addr = self.const_map[val]
+                all_slots.append(("load", ("const", addr, val)))
+
+        # Setup: init var loading using pre-allocated const addresses
+        # These loads read from const_map[i] which must already contain value i
+        for i, v in enumerate(init_vars):
+            all_slots.append(("load", ("load", self.scratch[v], self.const_map[i])))
+
+        # Vector constant broadcasts
+        all_slots.append(("valu", ("vbroadcast", zero_vec, zero_const)))
+        all_slots.append(("valu", ("vbroadcast", one_vec, one_const)))
+        all_slots.append(("valu", ("vbroadcast", two_vec, two_const)))
+        all_slots.append(("valu", ("vbroadcast", n_nodes_vec, self.scratch["n_nodes"])))
+        three_const = self.const_map[3]
         three_vec = self.alloc_scratch("three_vec", VLEN)
-        init_slots.append(("valu", ("vbroadcast", three_vec, three_const)))
+        all_slots.append(("valu", ("vbroadcast", three_vec, three_const)))
+        four_const = self.const_map[4]
+        all_slots.append(("valu", ("vbroadcast", four_vec, four_const)))
 
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            v1_const = self.scratch_const(val1)
-            v3_const = self.scratch_const(val3)
-            init_slots.append(("valu", ("vbroadcast", hash_const_vecs[hi]['val1_vec'], v1_const)))
-            init_slots.append(("valu", ("vbroadcast", hash_const_vecs[hi]['val3_vec'], v3_const)))
+            v1_const = self.const_map[val1]
+            v3_const = self.const_map[val3]
+            all_slots.append(("valu", ("vbroadcast", hash_const_vecs[hi]['val1_vec'], v1_const)))
+            all_slots.append(("valu", ("vbroadcast", hash_const_vecs[hi]['val3_vec'], v3_const)))
             if hash_const_vecs[hi]['use_ma']:
-                mult_const = self.scratch_const(hash_const_vecs[hi]['mult_val'])
-                init_slots.append(("valu", ("vbroadcast", hash_const_vecs[hi]['mult_vec'], mult_const)))
-
-        init_instrs = self.pack_slots(init_slots)
-        self.instrs.extend(init_instrs)
+                mult_const = self.const_map[hash_const_vecs[hi]['mult_val']]
+                all_slots.append(("valu", ("vbroadcast", hash_const_vecs[hi]['mult_vec'], mult_const)))
 
         # --- Main loop body ---
         # Process all rounds for each batch of groups before moving to next batch.
@@ -461,61 +507,52 @@ class KernelBuilder:
             actual_groups = min(BATCH_SIZE_GROUPS, n_vec_batches - vb_start)
 
             # Load initial val from memory and set idx to zero (all initial indices are 0)
-            load_slots = []
             for g in range(actual_groups):
                 vb = vb_start + g
                 gd = group_data[g]
                 base_elem = vb * VLEN
-                base_offset_const = self.scratch_const(base_elem)
+                base_offset_const = self.const_map[base_elem]
 
                 val_addr_s = gd['val_addr_s']
                 idx_vec = gd['idx_vec']
                 val_vec = gd['val_vec']
 
-                load_slots.append(("alu", ("+", val_addr_s, self.scratch["inp_values_p"], base_offset_const)))
-                load_slots.append(("load", ("vload", val_vec, val_addr_s)))
+                all_slots.append(("alu", ("+", val_addr_s, self.scratch["inp_values_p"], base_offset_const)))
+                all_slots.append(("load", ("vload", val_vec, val_addr_s)))
                 # Set idx_vec to zero (all initial indices are 0)
-                load_slots.append(("valu", ("+", idx_vec, zero_vec, zero_vec)))
-
-            load_instrs = self.pack_slots(load_slots)
-            self.instrs.extend(load_instrs)
-
-            # Process all rounds with idx/val staying in scratch
-            # Pack ALL rounds together for maximum ILP
-            body_slots = []
+                all_slots.append(("valu", ("+", idx_vec, zero_vec, zero_vec)))
 
             # Load forest values for broadcast-optimized rounds
-            fvp1_const = self.scratch_const(1)
-            fvp2_const = self.scratch_const(2)
-            fvp3_const = self.scratch_const(3)
-            fvp4_const = self.scratch_const(4)
-            fvp5_const = self.scratch_const(5)
-            fvp6_const = self.scratch_const(6)
-            body_slots.append(("load", ("load", fv0_scalar, fvp_scalar)))
-            body_slots.append(("alu", ("+", fv1_scalar, fvp_scalar, fvp1_const)))
-            body_slots.append(("alu", ("+", fv2_scalar, fvp_scalar, fvp2_const)))
-            body_slots.append(("alu", ("+", fv3_scalar, fvp_scalar, fvp3_const)))
-            body_slots.append(("alu", ("+", fv5_scalar, fvp_scalar, fvp5_const)))
-            body_slots.append(("load", ("load", fv1_scalar, fv1_scalar)))
-            body_slots.append(("load", ("load", fv2_scalar, fv2_scalar)))
-            body_slots.append(("load", ("load", fv3_scalar, fv3_scalar)))
-            body_slots.append(("load", ("load", fv5_scalar, fv5_scalar)))
-            body_slots.append(("valu", ("vbroadcast", fv0_vec, fv0_scalar)))
-            body_slots.append(("valu", ("vbroadcast", fv1_vec, fv1_scalar)))
-            body_slots.append(("valu", ("vbroadcast", fv2_vec, fv2_scalar)))
-            body_slots.append(("valu", ("vbroadcast", fv3_vec, fv3_scalar)))
-            body_slots.append(("valu", ("vbroadcast", fv5_vec, fv5_scalar)))
-            body_slots.append(("valu", ("-", fv_diff_vec, fv1_vec, fv2_vec)))
+            fvp1_const = self.const_map[1]
+            fvp2_const = self.const_map[2]
+            fvp3_const = self.const_map[3]
+            fvp4_const = self.const_map[4]
+            fvp5_const = self.const_map[5]
+            fvp6_const = self.const_map[6]
+            all_slots.append(("load", ("load", fv0_scalar, fvp_scalar)))
+            all_slots.append(("alu", ("+", fv1_scalar, fvp_scalar, fvp1_const)))
+            all_slots.append(("alu", ("+", fv2_scalar, fvp_scalar, fvp2_const)))
+            all_slots.append(("alu", ("+", fv3_scalar, fvp_scalar, fvp3_const)))
+            all_slots.append(("alu", ("+", fv5_scalar, fvp_scalar, fvp5_const)))
+            all_slots.append(("load", ("load", fv1_scalar, fv1_scalar)))
+            all_slots.append(("load", ("load", fv2_scalar, fv2_scalar)))
+            all_slots.append(("load", ("load", fv3_scalar, fv3_scalar)))
+            all_slots.append(("load", ("load", fv5_scalar, fv5_scalar)))
+            all_slots.append(("valu", ("vbroadcast", fv0_vec, fv0_scalar)))
+            all_slots.append(("valu", ("vbroadcast", fv1_vec, fv1_scalar)))
+            all_slots.append(("valu", ("vbroadcast", fv2_vec, fv2_scalar)))
+            all_slots.append(("valu", ("vbroadcast", fv3_vec, fv3_scalar)))
+            all_slots.append(("valu", ("vbroadcast", fv5_vec, fv5_scalar)))
+            all_slots.append(("valu", ("-", fv_diff_vec, fv1_vec, fv2_vec)))
             # Compute fv3-fv4 and fv5-fv6 diff vectors for round 13
-            # (odd_val - even_val, with even as base)
-            body_slots.append(("alu", ("+", fv4_scalar, fvp_scalar, fvp4_const)))
-            body_slots.append(("load", ("load", fv4_scalar, fv4_scalar)))
-            body_slots.append(("valu", ("vbroadcast", fv4_vec, fv4_scalar)))
-            body_slots.append(("valu", ("-", fv4m3_vec, fv3_vec, fv4_vec)))  # fv3 - fv4
-            body_slots.append(("alu", ("+", fv6_scalar, fvp_scalar, fvp6_const)))
-            body_slots.append(("load", ("load", fv6_scalar, fv6_scalar)))
-            body_slots.append(("valu", ("vbroadcast", fv6_vec, fv6_scalar)))
-            body_slots.append(("valu", ("-", fv6m5_vec, fv5_vec, fv6_vec)))  # fv5 - fv6
+            all_slots.append(("alu", ("+", fv4_scalar, fvp_scalar, fvp4_const)))
+            all_slots.append(("load", ("load", fv4_scalar, fv4_scalar)))
+            all_slots.append(("valu", ("vbroadcast", fv4_vec, fv4_scalar)))
+            all_slots.append(("valu", ("-", fv4m3_vec, fv3_vec, fv4_vec)))  # fv3 - fv4
+            all_slots.append(("alu", ("+", fv6_scalar, fvp_scalar, fvp6_const)))
+            all_slots.append(("load", ("load", fv6_scalar, fv6_scalar)))
+            all_slots.append(("valu", ("vbroadcast", fv6_vec, fv6_scalar)))
+            all_slots.append(("valu", ("-", fv6m5_vec, fv5_vec, fv6_vec)))  # fv5 - fv6
 
             for rnd in range(rounds):
                 for g in range(actual_groups):
@@ -528,84 +565,79 @@ class KernelBuilder:
                     tmp_v1 = gd['tmp_v1']
                     tmp_v2 = gd['tmp_v2']
 
-                    all_idx_zero = (rnd == 0) or (rnd == forest_height + 1 and forest_height < rounds)
-                    idx_in_1_2 = (rnd == forest_height + 2 and forest_height + 2 < rounds)
-                    idx_in_3_6 = (rnd == forest_height + 3 and forest_height + 3 < rounds)
+                    effective_level = rnd if rnd <= forest_height else rnd - (forest_height + 1)
+                    all_idx_zero = (effective_level == 0)
+                    idx_in_1_2 = (effective_level == 1)
+                    idx_in_3_6 = (effective_level == 2)
 
                     if all_idx_zero:
-                        body_slots.append(("valu", ("+", node_val_vec, fv0_vec, zero_vec)))
+                        # Merge node_val copy and XOR: val ^= fv0 directly
+                        all_slots.append(("valu", ("^", val_vec, val_vec, fv0_vec)))
                     elif idx_in_1_2:
-                        body_slots.append(("valu", ("&", tmp_v1, idx_vec, one_vec)))
-                        body_slots.append(("valu", ("multiply_add", node_val_vec, tmp_v1, fv_diff_vec, fv2_vec)))
+                        all_slots.append(("valu", ("&", tmp_v1, idx_vec, one_vec)))
+                        all_slots.append(("valu", ("multiply_add", node_val_vec, tmp_v1, fv_diff_vec, fv2_vec)))
+                        all_slots.append(("valu", ("^", val_vec, val_vec, node_val_vec)))
                     elif idx_in_3_6:
                         # idx in {3,4,5,6}. Use 2-level multiply_add.
-                        # bit0 = idx & 1 (1 for odd {3,5}, 0 for even {4,6})
-                        body_slots.append(("valu", ("&", tmp_v1, idx_vec, one_vec)))
-                        # low = bit0*(fv3-fv4)+fv4 : idx=3->fv3, idx=4->fv4 (stored in shared_tmp)
-                        body_slots.append(("valu", ("multiply_add", shared_tmp, tmp_v1, fv4m3_vec, fv4_vec)))
-                        # high = bit0*(fv5-fv6)+fv6 : idx=5->fv5, idx=6->fv6 (stored in node_val_vec)
-                        body_slots.append(("valu", ("multiply_add", node_val_vec, tmp_v1, fv6m5_vec, fv6_vec)))
-                        # bit1 = ((idx-3) >> 1) & 1 : 0 for {3,4}, 1 for {5,6}
-                        body_slots.append(("valu", ("-", tmp_v1, idx_vec, three_vec)))
-                        body_slots.append(("valu", (">>", tmp_v1, tmp_v1, one_vec)))
-                        body_slots.append(("valu", ("&", tmp_v1, tmp_v1, one_vec)))
-                        # diff = high - low (overwrites node_val_vec with diff)
-                        body_slots.append(("valu", ("-", node_val_vec, node_val_vec, shared_tmp)))
-                        # result = bit1*diff + low = multiply_add(node_val_vec, bit1, diff, low)
-                        body_slots.append(("valu", ("multiply_add", node_val_vec, tmp_v1, node_val_vec, shared_tmp)))
+                        all_slots.append(("valu", ("&", tmp_v1, idx_vec, one_vec)))
+                        all_slots.append(("valu", ("multiply_add", shared_tmp, tmp_v1, fv4m3_vec, fv4_vec)))
+                        all_slots.append(("valu", ("multiply_add", node_val_vec, tmp_v1, fv6m5_vec, fv6_vec)))
+                        all_slots.append(("valu", ("-", tmp_v1, idx_vec, three_vec)))
+                        all_slots.append(("valu", (">>", tmp_v1, tmp_v1, one_vec)))
+                        all_slots.append(("valu", ("&", tmp_v1, tmp_v1, one_vec)))
+                        all_slots.append(("valu", ("-", node_val_vec, node_val_vec, shared_tmp)))
+                        all_slots.append(("valu", ("multiply_add", node_val_vec, tmp_v1, node_val_vec, shared_tmp)))
+                        all_slots.append(("valu", ("^", val_vec, val_vec, node_val_vec)))
                     else:
                         for lane in range(VLEN):
-                            body_slots.append(("alu", ("+", addr_vec + lane, idx_vec + lane, fvp_scalar)))
+                            all_slots.append(("alu", ("+", addr_vec + lane, idx_vec + lane, fvp_scalar)))
                         for lane in range(VLEN):
-                            body_slots.append(("load", ("load_offset", node_val_vec, addr_vec, lane)))
-
-                    body_slots.append(("valu", ("^", val_vec, val_vec, node_val_vec)))
+                            all_slots.append(("load", ("load_offset", node_val_vec, addr_vec, lane)))
+                        all_slots.append(("valu", ("^", val_vec, val_vec, node_val_vec)))
 
                     for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                         v1_vec = hash_const_vecs[hi]['val1_vec']
                         v3_vec = hash_const_vecs[hi]['val3_vec']
                         if hash_const_vecs[hi]['use_ma']:
                             mult_vec = hash_const_vecs[hi]['mult_vec']
-                            body_slots.append(("valu", ("multiply_add", val_vec, val_vec, mult_vec, v1_vec)))
+                            all_slots.append(("valu", ("multiply_add", val_vec, val_vec, mult_vec, v1_vec)))
                         else:
-                            body_slots.append(("valu", (op1, tmp_v1, val_vec, v1_vec)))
-                            body_slots.append(("valu", (op3, tmp_v2, val_vec, v3_vec)))
-                            body_slots.append(("valu", (op2, val_vec, tmp_v1, tmp_v2)))
+                            all_slots.append(("valu", (op1, tmp_v1, val_vec, v1_vec)))
+                            # ALU shift offload: use 8 scalar ALU ops instead of 1 VALU op
+                            for lane in range(VLEN):
+                                all_slots.append(("alu", (op3, tmp_v2 + lane, val_vec + lane, v3_vec + lane)))
+                            all_slots.append(("valu", (op2, val_vec, tmp_v1, tmp_v2)))
 
                     # idx = 2*idx + (val&1) + 1
-                    body_slots.append(("valu", ("&", tmp_v1, val_vec, one_vec)))
-                    body_slots.append(("valu", ("+", tmp_v1, tmp_v1, one_vec)))
-                    body_slots.append(("valu", ("multiply_add", idx_vec, idx_vec, two_vec, tmp_v1)))
+                    # Compute 2*idx+1 and val&1 in parallel (independent), then add
+                    all_slots.append(("valu", ("multiply_add", tmp_v2, idx_vec, two_vec, one_vec)))
+                    all_slots.append(("valu", ("&", tmp_v1, val_vec, one_vec)))
+                    all_slots.append(("valu", ("+", idx_vec, tmp_v2, tmp_v1)))
 
                     if rnd == forest_height:
                         # idx = 0 if idx >= n_nodes else idx
-                        # Using VALU: cond = (idx < n_nodes), idx = idx * cond
-                        body_slots.append(("valu", ("<", tmp_v1, idx_vec, n_nodes_vec)))
-                        body_slots.append(("valu", ("*", idx_vec, idx_vec, tmp_v1)))
-
-            packed = self.pack_slots(body_slots)
-            self.instrs.extend(packed)
+                        all_slots.append(("valu", ("<", tmp_v1, idx_vec, n_nodes_vec)))
+                        all_slots.append(("valu", ("*", idx_vec, idx_vec, tmp_v1)))
 
             # Store final idx and val back to memory
-            store_slots = []
             for g in range(actual_groups):
                 vb = vb_start + g
                 gd = group_data[g]
                 base_elem = vb * VLEN
-                base_offset_const = self.scratch_const(base_elem)
+                base_offset_const = self.const_map[base_elem]
 
                 idx_addr_s = gd['idx_addr_s']
                 val_addr_s = gd['val_addr_s']
                 idx_vec = gd['idx_vec']
                 val_vec = gd['val_vec']
 
-                store_slots.append(("alu", ("+", idx_addr_s, self.scratch["inp_indices_p"], base_offset_const)))
-                store_slots.append(("alu", ("+", val_addr_s, self.scratch["inp_values_p"], base_offset_const)))
-                store_slots.append(("store", ("vstore", idx_addr_s, idx_vec)))
-                store_slots.append(("store", ("vstore", val_addr_s, val_vec)))
+                all_slots.append(("alu", ("+", idx_addr_s, self.scratch["inp_indices_p"], base_offset_const)))
+                all_slots.append(("alu", ("+", val_addr_s, self.scratch["inp_values_p"], base_offset_const)))
+                all_slots.append(("store", ("vstore", idx_addr_s, idx_vec)))
+                all_slots.append(("store", ("vstore", val_addr_s, val_vec)))
 
-            store_instrs = self.pack_slots(store_slots)
-            self.instrs.extend(store_instrs)
+        packed = self.pack_slots(all_slots)
+        self.instrs.extend(packed)
 
         self.instrs.append({"flow": [("pause",)]})
 

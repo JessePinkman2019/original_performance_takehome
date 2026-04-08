@@ -1,40 +1,66 @@
-# ROUND_PLAN.md — Round 2 融合计划
+# ROUND_PLAN.md — Round 3
+
+## 规划器读取的输入文件
+- PERF_REPORT.md: Round 2 全量评估（F 有 trace，E/G/H 仅 cycle 数）
+- CHANGELOG.md: 完整优化历史
+- perf_takehome.py: 当前 F 代码
+- problem.py: VM 语义
 
 ## 当前状态
-- 最佳：1,820 cycles (Agent D)
-- 目标：< 1,487 cycles
+- 1,811 cycles (Agent F)
+- LOAD: 87.7% (3,174 slots), floor 1,587
+- VALU: 80.1% (8,702 slots), floor 1,451
+- ALU: 14.6% (3,174 slots), 85% 空闲
+- 目标: < 1,487
 
-## 规划器发现的两个关键 Bug
+## 规划器发现的关键 Bug
 
-### Bug 1: 第二遍遍历未命中缓存
-Round 10 wrap 后所有 item 回到 idx=0，rounds 11-13 访问 levels 0-2（已缓存），但代码 `use_cache=(rnd < cache_levels)` 只检查 round 编号 < 3，漏掉了 11/12/13。浪费 768 scatter loads (~384 cycles)。
-修复：`use_cache = get_read_level(rnd) < cache_levels`，其中 `get_read_level(rnd) = rnd if rnd <= 10 else rnd - 11`
+### First-Pass Broadcast 缺失
+Round 1 所有 idx 在 {1,2}（level 1），Round 2 所有 idx 在 {3,4,5,6}（level 2）。
+这和 Round 12/13（wrap 后的 level 1/2）完全相同，但当前代码只对 Round 12/13 做了 broadcast，Round 1/2 仍在做 scatter load。
 
-### Bug 2: 不必要的 wrap check  
-Round 11-15 的 idx 远小于 n_nodes=2047，不需要 wrap。只有 round 10 需要。浪费 320 ops。
-修复：`needs_wrap=(rnd == 10)`
+**修复**：用 effective_level 替代 round 编号判断：
+```python
+effective_level = rnd if rnd <= forest_height else rnd - (forest_height + 1)
+all_idx_zero = (effective_level == 0)
+idx_in_1_2 = (effective_level == 1)
+idx_in_3_6 = (effective_level == 2)
+```
+
+预期节省：512 loads（2 轮 × 256），零 scratch 开销。
 
 ## 修复后瓶颈翻转
-修复两个 bug 后 LOAD 从 3,429 降至 ~2,661，floor 从 1,714 降至 1,330。VALU 成为新瓶颈（floor ~1,467）。
+修复后 LOAD 从 3,174 降至 ~2,662，floor 从 1,587 降至 1,331。
+VALU 成为新瓶颈（floor ~1,504）。需要 ALU shift offload 压低 VALU。
 
-## 四个融合方向
+---
 
-### Generator E: 保守修 bug（预期 1,480-1,540）
-- 修 Bug 1 + Bug 2
-- BATCH_SIZE_GROUPS 从 4 增到 8
-- 无其他改动
+## 四个生成器策略
 
-### Generator F: E + ALU 地址计算（预期 1,430-1,500）
-- E 的所有修复
-- scatter 地址用 8 个 ALU 标量 ops 替代 1 个 VALU op（融合 Agent B）
-- BATCH_SIZE_GROUPS = 16
+### Generator I: First-Pass Broadcast + ALU Shift（推荐，预期 1,430-1,530）
+- 修复 first-pass broadcast（3 行改动）
+- ALU shift offload：hash 阶段 1/3/5 的 shift 用 8 个 ALU 标量 ops 替代 1 个 VALU op
+- 风险：低-中。两个独立改动。
 
-### Generator G: F + ALU hash shift（预期 1,350-1,430）
-- F 的所有改动
-- hash 阶段 1/3/5 的 shift 操作用 8 个 ALU 替代 1 个 VALU
-- BATCH_SIZE_GROUPS = 32
+### Generator J: First-Pass Broadcast Only（安全后备，预期 1,580-1,650）
+- 只修复 first-pass broadcast
+- 不做其他改动
+- 风险：低。验证 broadcast fix 正确性。
 
-### Generator H: F + 树缓存 level 3 + 平衡调度（预期 1,380-1,450）
-- F 的所有改动
-- 树缓存扩展到 level 3（8 额外节点）
-- Agent C 启发的动态平衡调度
+### Generator K: I + Level 3 Cache（预期 1,350-1,480）
+- I 的所有改动
+- 缓存 tree level 3（8 节点，rounds 3/14）
+- 3 级 MUX 选择树
+- 风险：中。MUX 代码复杂。
+
+### Generator L: I + 调度器优化（预期 1,400-1,530）
+- I 的所有改动
+- 优化列表调度器的 load 优先级策略
+- 减少 224 cycles 调度 overhead
+- 风险：低-中。
+
+## 关键规则
+1. **所有 4 个必须包含 first-pass broadcast fix**
+2. **SURGICAL EDITS ONLY**（Round 2 教训：E/H 重写退步）
+3. **不要减小 BATCH_SIZE_GROUPS**
+4. **改动前后对比 cycle 数**

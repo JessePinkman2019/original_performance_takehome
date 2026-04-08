@@ -1,153 +1,96 @@
-# PERF_REPORT.md — Agent A (List Scheduler)
+# PERF_REPORT.md — Round 3 全量评估
 
-## 基本结果
-- **正确性**：通过
-- **Cycle 数**：2,044（从 9,936 降低 79.4%，72.3x over baseline）
-- **通过测试**：4/9（含 test_opus4_many_hours < 2,164）
-- **tests/ 修改检查**：空（未作弊）
-- **Scratch 使用**：1,446 / 1,536（94.1%）
-- **裁决**：MERGE
-
-## 引擎利用率分析
-
-| 引擎 | Slots 使用 | 最大可能 | 利用率 | 活跃 Cycles | 平均 Slots/Cycle |
-|------|-----------|---------|--------|------------|-----------------|
-| **LOAD** | **3,937** | **4,086** | **96.4%** | 1,970/2,043 | **1.93/2** |
-| **VALU** | 9,745 | 12,258 | 79.5% | 1,994/2,043 | 4.77/6 |
-| ALU | 128 | 24,516 | 0.5% | 64/2,043 | 0.06/12 |
-| STORE | 64 | 4,086 | 1.6% | 64/2,043 | 0.03/2 |
-| FLOW | 2 | 2,043 | 0.1% | 2/2,043 | 0.00/1 |
-
-## 瓶颈诊断
-
-**主瓶颈：Load 引擎（96.4% 利用率）**
-- Load 引擎连续满载最长 streak：**1,864 cycles**（几乎整个执行过程）
-- 2 slots/cycle 是硬件上限，已接近理论极限
-- 3,937 loads / 2 per cycle = 1,969 cycles 纯 load 时间
-
-**次瓶颈：VALU 引擎（79.5% 利用率）**
-- VALU 连续满载 streak：284 cycles
-- 平均 4.77/6 slots/cycle，还有 ~20% 空间
-
-**严重浪费：ALU 引擎（0.5% 利用率）**
-- 12 slots/cycle 几乎完全空闲
-- 每 cycle 有 12 个标量计算 slot 可用但未使用
-
-## 优化建议（下一轮 Round Plan 输入）
-
-### 方向 1：减少 scatter loads（高优先级）
-- Round 0 已做 broadcast（Agent A 实现了）
-- **Round 10 也应该 broadcast**（同样所有 item 在根节点）
-- **Rounds 1-3, 11-13 用 MUX**：树层级 1-3 只有 2-8 个唯一节点
-- 预期：减少 ~4 轮的 load 量，每轮节省 ~120 cycles → **~480 cycles 节省**
-
-### 方向 2：ALU 补充 VALU（中优先级）
-- ALU 96.9% 空闲，VALU 79.5% 忙碌
-- 将部分 hash 计算的个别 lane 用 ALU 标量执行
-- 每 cycle 最多用 12 个 ALU slot 处理 12 个标量 lane
-- 预期：降低 VALU 瓶颈 ~15-20%
+## 评估完整性：✅ 全部 4 个 worktree 已完成 trace 分析
 
 ---
 
-## Agent B 分析（2,383 cycles — REJECTED，但有技术洞察）
+## Round 3 结果总览
 
-### 引擎利用率
-
-| 引擎 | A (2,044) | B (2,383) | 差异 |
-|------|----------|----------|------|
-| **LOAD** | 96.4% (3,937 slots) | 88.6% (4,221 slots) | B 多 284 loads 但利用率反而低 → 调度效率差 |
-| **VALU** | 79.5% (9,745 slots) | 64.6% (9,235 slots) | B 用 510 fewer VALU → ALU 分担了部分 |
-| **ALU** | 0.5% (128 slots) | **14.8% (4,224 slots)** | **B 用 ALU 做地址计算，释放了 VALU** |
-
-### 关键洞察（从 B 提取，供规划器使用）
-
-1. **B 的 ALU 使用是正确方向**：B 用 4,096 个 ALU slots 做 scatter 地址计算（32 groups × 8 lanes × 16 rounds = 4,096），把地址计算从 VALU 移到 ALU。这释放了 VALU capacity。
-2. **但 B 反而更慢**：因为 B 多用了 284 个 loads（4,221 vs 3,937），说明 B 没有做 round-0 broadcast 优化（A 做了）。多出的 load 反而加剧了 Load 瓶颈。
-3. **B 的调度质量不如 A**：VALU 利用率 64.6% vs A 的 79.5%，说明交错排列不如 DAG 列表调度紧凑。
-4. **合并思路**：如果把 B 的 "ALU 做地址计算" 加入 A 的列表调度器，可能同时获得 A 的调度质量 + B 的 ALU 利用。
+| Agent | 策略 | Cycles | LOAD% (slots) | VALU% (slots) | ALU% (slots) | 通过 | 裁决 |
+|-------|------|--------|---------------|---------------|--------------|------|------|
+| **L** | I + 关键路径调度 + WAR放松 + 全阶段合并 + 并行idx | **1,391** | **95.5% (2,655)** | **89.0% (7,423)** | **89.6% (14,950)** | **8/9** | **MERGE** |
+| K | I + 关键路径调度 + fused XOR | 1,503 | 88.6% (2,662) | 82.4% (7,422) | 82.9% (14,950) | 7/9 | 有价值 |
+| I | Broadcast fix + ALU shift | 1,714 | 77.7% (2,662) | 72.8% (7,486) | 72.7% (14,950) | 5/9 | 基准 |
+| J | Broadcast fix only | 1,787 | 74.5% (2,662) | 84.2% (9,022) | 12.4% (2,662) | 5/9 | 安全后备 |
 
 ---
 
-## Agent C 分析（1,994 cycles — 新冠军，待 MERGE）
+## Agent L 详细分析（1,391 cycles — WINNER）
 
-### 引擎利用率
+### 为什么 L 赢
+1. **关键路径调度（reverse depth）**：与 K 相同的核心优化，减 ~200 cycles
+2. **WAR bundle 放松**：VLIW 同 cycle 内 read-before-write 是安全的，去掉了不必要的 WAR 约束 → 每 cycle 塞更多 slot
+3. **全阶段合并为单次 pack**：init broadcasts + vloads + body + stores 全部进同一个调度 DAG → 消除阶段间的空隙
+4. **Setup 折叠进 body**：常量 load 利用 body 中 load 引擎空闲的 cycle
+5. **并行 idx 更新**：`multiply_add(idx, two, one) || val&1` 并行执行，关键路径从 3 降到 2 VALU
+6. **三引擎近乎满载**：LOAD 95.5%, VALU 89.0%, ALU 89.6% — 史上最均衡
 
-| 引擎 | C (1,994) | A (2,044) | B (2,383) |
-|------|----------|----------|----------|
-| **LOAD** | **79.8% (3,180)** | 96.4% (3,937) | 88.6% (4,221) |
-| **VALU** | **80.0% (9,566)** | 79.5% (9,745) | 64.6% (9,235) |
-| ALU | 0.5% (124) | 0.5% (128) | 14.8% (4,224) |
-| FLOW | **10.1% (202)** | 0.1% (2) | 0.1% (2) |
-
-### 关键洞察：C 为什么赢
-
-1. **C 比 A 少了 757 个 loads**（3,180 vs 3,937）。说明 C 在更多 round 做了 broadcast/MUX 优化，不只是 round 0。
-2. **Load 和 VALU 利用率几乎相等**（79.8% vs 80.0%）——说明 C 的调度实现了两个引擎的近乎完美平衡。A 的 Load 96.4% 远高于 VALU 79.5%，说明 Load 是硬瓶颈。C 通过减少 loads 消除了这个瓶颈。
-3. **C 用了 flow 引擎**（10.1%，202 slots）——可能用了硬件循环（cond_jump），减少了代码膨胀。
-4. **Load 满载 streak 仅 1,148 cycles**（vs A 的 1,864）——C 有更多"呼吸空间"。
-
-### 三者核心差异总结
-
-```
-A: 调度优秀，但 Load 被 scatter loads 撑爆（96.4%）→ Load 瓶颈
-B: ALU 地址计算好主意，但调度差 + 没做 broadcast → 最慢
-C: 减少 loads（多做 broadcast？）+ 调度平衡 → 最快
-```
-
-### 下一轮规划器输入
-
-**C 证实了 PERF_REPORT A 的建议——减少 scatter loads 是正确方向。**
-- C 少了 757 loads 就快了 50 cycles
-- 理论上还有 ~1,000+ loads 可以通过 MUX（rounds 1-3, 11-13）消除
-- 如果把 scatter loads 再减一半（~1,590），可能接近 ~1,600 cycles
-
-## 裁决
-
-| Agent | Cycles | 裁决 |
-|-------|--------|------|
-| **C** | **1,994** | **NEW WINNER — MERGE** |
-| A | 2,044 | SUPERSEDED |
-| B | 2,383 | REJECT |
-| D | 🔄 | 待验证 |
-- 1,446 / 1,536 = 94.1% scratch 使用率，几乎没有余量
-- 如果 MUX 或 ALU 补充需要额外 scratch，必须先压缩
+### L 的理论下限分析
+- LOAD floor: 2,655 / 2 = 1,328 cycles
+- VALU floor: 7,423 / 6 = 1,237 cycles
+- ALU floor: 14,950 / 12 = 1,246 cycles
+- **硬瓶颈: LOAD (1,328)**
+- 当前 overhead: 1,391 - 1,328 = **63 cycles (4.7%)** — 极低
 
 ---
 
-## Agent D 分析（1,820 cycles — 最终冠军，MERGED）
+## Agent K 分析（1,503 cycles）
 
-### 引擎利用率
+### K 的独特贡献
+- **Bottom-up height scheduling**（与 L 独立发现同一技术）
+- **Fused XOR for level 0**：`val ^= fv0_vec` 直接合并（-5 cycles）
+- K 的 overhead: 1,503 - 1,331 = 172 cycles (11.5%) — L 更紧凑
 
-| 引擎 | D (1,820) | C (1,994) | A (2,044) | B (2,383) |
-|------|----------|----------|----------|----------|
-| **LOAD** | **94.3% (3,429)** | 79.8% (3,180) | 96.4% (3,937) | 88.6% (4,221) |
-| **VALU** | **82.3% (8,985)** | 80.0% (9,566) | 79.5% (9,745) | 64.6% (9,235) |
-| ALU | 0.3% (71) | 0.5% (124) | 0.5% (128) | 14.8% (4,224) |
-| FLOW | **17.7% (322)** | 10.1% (202) | 0.1% (2) | 0.1% (2) |
-| Scratch | **1,331/1,536** | ?/1,536 | 1,446/1,536 | 1,446/1,536 |
+### K 比 L 差的原因
+- 没做 WAR relaxation → 每 cycle 少塞 slot
+- 没做全阶段合并 → init 和 body 之间有空隙
+- 没做 setup 折叠 → load 引擎有空闲 cycle 未利用
+- 没做并行 idx 更新 → 关键路径多 1 cycle/group/round
 
-### D 为什么赢
+---
 
-1. **树层级缓存 levels 0-2**（7 节点）：6 轮无需 scatter loads
-2. **消除 wrap check**：早期 round 跳过 `< n_nodes` + `* cmp`
-3. **VALU 利用率最高（82.3%）**：hash 和 load 交错最紧凑
-4. **Scratch 余量最大（86.7%）**：为后续缓存扩展留空间
-5. **理论下限分析**：3,429 loads / 2 = 1,714 cycles，当前 1,820 仅多 6.2% overhead
+## Agent I 分析（1,714 cycles）
 
-### 4 Agent 竞赛总结
+### I 的贡献（已被 K/L 吸收）
+- First-pass broadcast fix（所有 agent 共享）
+- ALU shift offload（所有 agent 共享）
+- I 的 overhead: 1,714 - 1,331 = 383 cycles (22.3%) — 调度质量差
 
-```
-       Cycles | LOAD%  | VALU%  | 独特贡献
-  D:   1,820  | 94.3%  | 82.3%  | 树缓存 + wrap消除 + 紧凑调度 ← WINNER
-  C:   1,994  | 79.8%  | 80.0%  | Load/VALU 平衡调度
-  A:   2,044  | 96.4%  | 79.5%  | round-0 broadcast + 跨round流水线
-  B:   2,383  | 88.6%  | 64.6%  | ALU地址计算（想法好但调度差）
-```
+---
 
-### 下一轮规划器输入
+## Agent J 分析（1,787 cycles）
 
-瓶颈：Load 94.3%，接近理论下限 1,714 cycles。
-1. 扩展树缓存到 level 3-4（+24 节点 = 31 words），再减 ~4 轮 scatter loads
-2. ALU 补充 VALU（99.5% 空闲 → 巨大未利用资源）
-3. MUX 替代已缓存 level 的 scatter loads
-4. Scratch 余量 205 words 可用
+### J 的特殊数据点
+- **没有 ALU shift offload**：ALU 只有 12.4%（2,662 slots），VALU 却有 84.2%（9,022 slots）
+- 对比 I（有 ALU shift）：VALU 从 84.2% 降到 72.8%，ALU 从 12.4% 升到 72.7%
+- **证实 ALU shift offload 显著降低 VALU 压力**
+
+---
+
+## 各 Agent 独特贡献（供融合）
+
+| Agent | 独特技术 | 价值 | 是否已在 L 中 |
+|-------|---------|------|-------------|
+| L | WAR bundle 放松 | 高 | ✅ |
+| L | 全阶段合并单次 pack | 高 | ✅ |
+| L | Setup 折叠进 body | 中 | ✅ |
+| L | 并行 idx 更新 | 中 | ✅ |
+| K | Fused XOR for level 0 | 低（-5 cycles） | ❓ 需检查 L 是否有 |
+| K/L | 关键路径调度（reverse depth） | 极高（-200） | ✅ |
+| I/J | First-pass broadcast fix | 高（-24） | ✅ |
+| I | ALU shift offload | 高（-73） | ✅ |
+
+---
+
+## 下一轮规划器输入
+
+### 当前瓶颈
+- **LOAD floor = 1,328 cycles**，当前 1,391，overhead 仅 63 cycles
+- 三引擎都在 89%+ → 几乎没有空闲 slot 可利用
+- 距下一个目标 test_opus45_improved_harness (< 1,363) 还差 **28 cycles**
+
+### 优化方向
+1. **进一步减少 loads**：缓存 tree level 3（rounds 3/14，省 512 loads）→ load floor 降至 ~1,072
+2. **压缩 63 cycles overhead**：分析 trace 中 load 引擎空闲的具体 cycle 位置
+3. **K 的 fused XOR 如果 L 没有**：可省 ~5 cycles
+4. **并行度已接近极限**：三引擎 89%+ 意味着进一步改进必须减少总 op 数而非改善调度
