@@ -13,9 +13,33 @@
 | 早期 round 特判 (mod 0/1) | 2,966 | 49.8x |
 | 早期 round 特判 (mod 0/1/2) | 2,908 | 50.8x |
 | hextet 跨边界 tail/head 重叠 | 2,668 | 55.4x |
-| **addr 预取 + intra-hextet 流水线** | **2,638** | **56.0x** |
+| addr 预取 + intra-hextet 流水线 | 2,638 | 56.0x |
+| **per-group addr scalars + noload xor pipeline** | **2,580** | **57.3x** |
 
 通过测试：所有 < 147734 及 < 18532 及 baseline_updated，但未通过 < 2164（需继续优化）
+
+---
+
+## Round 10: per-group addr scalars + noload xor pipeline (2026-04-10)
+
+- 候选 010（per-group addr scalars + noload xor pipeline）: **2,580 cycles** — ACCEPT，merged（commit 3bde59b）
+- 改进：2,638 → 2,580 cycles（2.2% 降低，57.3x over baseline）
+
+### 010 技术细节
+- **per-group addr scalars**：为每组分配独立的 addr_idx_g[g] 和 addr_val_g[g] scratch，消除 init 和 store 阶段的 WAW（Write-After-Write）序列化。原先所有 32 组共享 addr_scalar/addr_scalar2，导致 alu ops 必须串行（不能同时写同一个 scratch）。现在 64 个独立 scalar → 32 个 idx alu ops 和 32 个 val alu ops 均可并行，打包进 3 cycles（12 alu/cycle）
+- **重排 init/store 顺序**：先发射所有 idx alu ops，再发射所有 val alu ops，再发射 vloads/vstores，让 packer 充分利用 alu×12 和 load×2 的并行
+- **xor-hash pipeline（special hextet）**：将 xor ops 分批与 hash ops 流水线化。先发射 A-F xors（1 cycle），再发射 G-K xors + A.hash[0]（共 6 valu）等，消除"等所有 16 组 xors 完成才开始 hash"的串行依赖，节约约 2 cycles
+
+### Round 10 引擎利用率（精确测量）
+| 引擎 | 总 ops | 满载 cycles | 空闲 cycles | 利用率 |
+|------|-------|-------------|-------------|--------|
+| valu | 10,151 | 766 | 358 | 65.5% |
+| load | 2,698 | 1,324 | 1,207 | 52.3% |
+
+### 理论下界（更新）
+- 总 valu ops: 10,151 → min cycles = ⌈10,151/6⌉ = 1,692
+- 加 setup（~120c）：**理论下界 ≈ 1,812c**
+- 当前差距：2,580 − 1,812 = **768 cycles**（主要来自 load engine idle 1,207c 和 valu 非满载 358c）
 
 ---
 

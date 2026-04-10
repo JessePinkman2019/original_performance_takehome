@@ -4,11 +4,10 @@
   "target_cycles": 1487,
   "stretch_target": 1363,
   "current_best": {
-    "cycles": 2668,
-    "commit": "cf65700",
-    "technique": "inter_hextet_tail_head_overlap_plus_early_round_special",
-    "per_group_cycles": 83.38,
-    "speedup_over_original_baseline": 55.37
+    "cycles": 2580,
+    "commit": "3bde59b",
+    "technique": "per_group_addr_plus_noload_xor_pipeline",
+    "speedup_over_original_baseline": 57.26
   },
   "known_bottlenecks": {
     "load": "8× load_offset per group → 4 cycles (load×2 slot limit)",
@@ -671,13 +670,123 @@
       "timestamp": "2026-04-10T23:40:01.000000",
       "commit": "65d92ec",
       "new_best": 2638
+    },
+    {
+      "type": "planner_decision",
+      "attempt_id": "009",
+      "timestamp": "2026-04-11T00:26:06.935227",
+      "technique": "full_cross_group_diagonal_scheduling",
+      "reasoning": "Planner Brain Round 9 Analysis (rerun):\n\nVALU OP COUNT: 10,134 total (confirmed match with evaluator).\n  mod0 x2 rounds: 1,154 valu (577/round = 32 groups * 18 ops/group)\n  mod1 x2 rounds: 1,286 valu (643/round = 32 groups * 20 ops)\n  mod2 x2 rounds: 1,614 valu (807/round = 32 groups * 25 ops)\n  normal x10 rounds: 6,080 valu (608/round = 32 groups * 19 ops)\n\nALTERNATIVES CONSIDERED AND REJECTED:\n1. Switch mod1/mod2 to load-based: saves 448 valu ops but adds 1024 load ops.\n   New load min = 1792c > valu min 1689c. Combined min = 1912c > current 1809c. WORSE.\n2. Eliminate addr_compute: load_offset reads scratch[base+lane] as RAW address.\n   Cannot encode forest_values_ptr + idx[g][lane] as separate base+offset. IMPOSSIBLE.\n\nCORRECT APPROACH: Keep ALL current ops unchanged. Change ONLY emission order.\n\nFUNDAMENTAL INSIGHT: Groups are completely independent. Within a group, rounds\nare sequential (round k depends on round k-1 idx). In current round-major order:\nALL groups finish round k before ANY group starts round k+1. This causes:\n- Special rounds 0,1,2 = pure valu, load engine idle for ~430c\n- Normal rounds have loads but special round valu cannot run simultaneously\n\nGROUP-MAJOR DIAGONAL: for g in 0..31: for r in 0..15: emit per_group_round_slots(g, r)\n- Group 0 finishes rounds 0,1,2 (pure valu, ~11c) then starts round 3 (loads)\n- Groups 1-31 still doing rounds 0-2 (pure valu) while group 0 does round 3 loads\n- The packer packs group 0 loads + groups 1-31 valu in same VLIW bundles\n- Special-round valu (4054 ops) fills normal-round load-idle slots\n\n1487c TARGET: MATHEMATICALLY IMPOSSIBLE. True floor = 1809c (10134/6 + 120 setup).\nBest realistic target: 1850-2200c. True stretch: approaching 1809c.\n\nIMPLEMENTATION: Replace all hextet emission with group-major per_group_round_slots().\nAll special-round setup must move to init (before pause). Keep 4-pair scheme.\nScratch budget: ~1432/1536 used, no expansion needed.",
+      "plan_file": "ROUND_PLAN_9.json",
+      "expected_cycles": "1700-2100"
+    },
+    {
+      "type": "generator_started",
+      "attempt_id": "009",
+      "timestamp": "2026-04-11T00:49:10.563774",
+      "worktree": ".claude/worktrees/attempt-009"
+    },
+    {
+      "type": "generator_done",
+      "attempt_id": "009",
+      "timestamp": "2026-04-11T00:54:31.527354",
+      "worktree": ".claude/worktrees/attempt-009",
+      "self_reported_cycles": 9864,
+      "status": "worse",
+      "finding": "group-major emission order causes the greedy left-to-right packer to serialize group 0 all 16 rounds before starting group 1. No cross-group interleaving occurs. 9864 cycles vs 2638 baseline. Plan hypothesis was flawed: for packer interleaving to work, slots from group 1 must appear immediately after group 0 round N, but group-major places them only after all 32 rounds of group 0."
+    },
+    {
+      "type": "generator_done",
+      "attempt_id": "009",
+      "timestamp": "2026-04-11T00:56:42.454709",
+      "self_reported_cycles": 9864,
+      "status": "failed",
+      "root_cause": "group-major loop: build() greedy packer cannot overlap group 0 round 3 loads with group 1-31 round 0 valu because group 0 all 16 rounds are emitted before group 1 starts. Slots are not interleaved in time."
+    },
+    {
+      "type": "evaluator_result",
+      "attempt_id": "009",
+      "timestamp": "2026-04-11T00:56:42.454721",
+      "cycles_before": 2638,
+      "cycles_after": 9864,
+      "improvement_pct": -273.9,
+      "passed": false,
+      "reject_reason": "massive regression: 9864 vs 2638. Group-major emission fails because build() is a greedy left-to-right packer - it cannot interleave group 0 round 3 loads with group 1-31 round 0 valu. The correct diagonal scheduling requires emitting slots from DIFFERENT groups at DIFFERENT rounds SIMULTANEOUSLY (true matrix diagonal traversal, not column-major).",
+      "key_learning": "Correct diagonal = for d in range(32+16-1): for g in diagonal d: emit per_group_round_slots(g, d-g). This ensures group g round r and group g+1 round r-1 are adjacent in slot list → packer sees them together."
+    },
+    {
+      "type": "planner_decision",
+      "attempt_id": "010",
+      "timestamp": "2026-04-10T17:14:56.001019",
+      "technique": "per_group_addr_scalars_plus_xor_hash_pipeline",
+      "reasoning": "Round 9 root cause: group-major diagonal emission broke pair-safety. Groups g=0 and g=4 share pair p=g%4=0. When g=4 at round d-4 and g=0 at round d appear adjacent in the diagonal slot stream, their hash operations both write/read t1_pair[0], causing data corruption (9864 cycles). True diagonal requires per-group pair scratch = 32x4x8=1024 extra words; budget only has 105. Diagonal scheduling is NOT viable.\n\nTrue remaining inefficiencies:\n1. INIT SECTION (120 cycles): 32 groups x (alu+vload+alu+vload) through 2 shared addr_scalar registers. WAW on shared scalar forces ~64 cycles of serial execution (vs 16-cycle theoretical minimum for 32 vloads at 2/cycle). \n2. STORE SECTION (64 cycles): same pattern, 32 groups serialized through shared addr_scalar/addr_scalar2.\n3. NOLOAD HEXTET XOR: 16 xors emitted in bulk (3 cycles) before any hash. Group A.xor completes cycle 1; A.hash[0] could start cycle 2 while later groups fill xor slots.\n\nFix 1+2: allocate per-group addr_idx_g[g] and addr_val_g[g] scalars (64 words, within 105-word budget). Emit all addr alu ops first (no WAW conflicts -> 3 bundles), then interleave vloads/vstores (2/cycle minimum). Saving: ~42c init + ~28c store = ~70c total.\n\nFix 3: reorder xor+hash emission in emit_hextet_noload to pipeline A.hash[0] at slot 7 (after first 6 xors). Saving: ~1-2c per hextet x 4 calls = ~16c.\n\nExpected result: 2638 - 70 - 16 ≈ 2552c (well below 2600 success threshold).",
+      "expected_cycles": 2549,
+      "success_threshold": 2610,
+      "abort_threshold": 2650,
+      "plan_file": "ROUND_PLAN_10.json",
+      "key_learning": "Round 9 diagonal failed due to pair scratch conflicts. True opportunity is in init/store section serialization via shared addr_scalars (64c wasted per section). Per-group addr_scalars (64 scratch words) unlocks this parallelism cleanly."
+    },
+    {
+      "type": "generator_started",
+      "attempt_id": "010",
+      "timestamp": "2026-04-11T01:16:55.168591",
+      "worktree": ".claude/worktrees/attempt-010"
+    },
+    {
+      "type": "generator_done",
+      "attempt_id": "010",
+      "timestamp": "2026-04-11T01:18:53.318155",
+      "cycles": 2580,
+      "baseline": 2638,
+      "improvement": 58,
+      "tests_passed": 3,
+      "tests_total": 9,
+      "result_file": "ATTEMPT_RESULT_10.json"
+    },
+    {
+      "type": "evaluator_result",
+      "attempt_id": "010",
+      "timestamp": "2026-04-11T01:22:17.972148",
+      "cycles_before": 2638,
+      "cycles_after": 2580,
+      "improvement_pct": 2.2,
+      "passed": true,
+      "thresholds_passed": [
+        "baseline_147734",
+        "10x_14773",
+        "5x_29547",
+        "2x_73867"
+      ],
+      "thresholds_failed": [
+        "test_opus4_many_hours_2164",
+        "test_opus45_casual_1790",
+        "test_sonnet45_many_hours_1548",
+        "test_opus45_2hr_1579",
+        "test_opus45_11hr_1487",
+        "test_opus45_improved_harness_1363"
+      ],
+      "factual_analysis": {
+        "setup_cycles": 92,
+        "normal_rounds_cycles": 1822,
+        "special_rounds_cycles": 666,
+        "store_cycles": 31,
+        "total_valu_ops": 10151,
+        "valu_full_packed_cycles": 766,
+        "valu_idle_cycles": 358,
+        "valu_utilization_pct": 65.5,
+        "load_full_packed_cycles": 1324,
+        "load_idle_cycles": 1207,
+        "load_utilization_pct": 52.3,
+        "theoretical_minimum_valu_bound": 1692,
+        "theoretical_minimum_with_setup": 1812,
+        "current_gap_from_theory": 768
+      }
+    },
+    {
+      "type": "merged",
+      "attempt_id": "010",
+      "commit": "3bde59b",
+      "new_best": 2580
     }
-  ],
-  "current_best": {
-    "cycles": 2638,
-    "commit": "65d92ec",
-    "technique": "intra_hextet_overlap_v2_plus_addr_prefetch",
-    "per_group_cycles": 82.44,
-    "speedup_over_original_baseline": 56.0
-  }
+  ]
 }
