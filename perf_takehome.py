@@ -488,11 +488,12 @@ class KernelBuilder:
         # --- No-load hextet: pure valu hextet for rounds with broadcast nv ---
         # Uses the same careful diagonal ordering as the normal hextet (just no addr/load).
         # This ensures pair-reuse safety (same as normal hextet).
-        def emit_hextet_noload(body, grp_start, nv_bcast):
+        def emit_hextet_noload(body, grp_start, nv_bcast, next_s=None):
             """Emit 16-group no-load hextet using nv_bcast for xor.
             Uses the exact same diagonal ordering as normal hextet (steps 1-63),
             but skips all addr and load slots, replacing xor with bcast-xor.
-            Pair safety is maintained by the same ordering constraints."""
+            Pair safety is maintained by the same ordering constraints.
+            If next_s is provided, prefetch next round's hextet0 head in the tail."""
             gA, gB, gC, gD = grp_start, grp_start+1, grp_start+2, grp_start+3
             gE, gF, gG, gH = grp_start+4, grp_start+5, grp_start+6, grp_start+7
             gI, gJ, gK, gL = grp_start+8, grp_start+9, grp_start+10, grp_start+11
@@ -903,79 +904,55 @@ class KernelBuilder:
             body.append(o_hash[1])
             body.append(o_hash[2])
 
-            # Step 50: M.idx[0] + N.hash[7] + O.hash[3] + P.hash[0]
-            body.append(m_idx[0])
-            body.append(n_hash[7])
-            body.append(o_hash[3])
-            body.append(p_hash[0])
+            # Tail with optional next-round prefetch
+            if next_s is not None:
+                na_addr_nl = next_s['a_addr']; na_loads_nl = next_s['a_loads']
+                nb_addr_nl = next_s['b_addr']; nb_loads_nl = next_s['b_loads']
+                nc_addr_nl = next_s['c_addr']; nc_loads_nl = next_s['c_loads']
+                nd_addr_nl = next_s['d_addr']
+            else:
+                na_addr_nl = nb_addr_nl = nc_addr_nl = nd_addr_nl = []
+                na_loads_nl = nb_loads_nl = nc_loads_nl = []
 
-            # Step 51: M.idx[1] + N.hash[8] + O.hash[4] + P.hash[1:3]
-            body.append(m_idx[1])
-            body.append(n_hash[8])
-            body.append(o_hash[4])
-            body.append(p_hash[1])
-            body.append(p_hash[2])
-
-            # Step 52: M.idx[2] + N.hash[9:11] + O.hash[5:7] + P.hash[3]
-            body.append(m_idx[2])
-            body.append(n_hash[9])
-            body.append(n_hash[10])
-            body.append(o_hash[5])
-            body.append(o_hash[6])
-            body.append(p_hash[3])
-
-            # Step 53: M.idx[3] + N.hash[11] + O.hash[7] + P.hash[4]
-            body.append(m_idx[3])
-            body.append(n_hash[11])
-            body.append(o_hash[7])
-            body.append(p_hash[4])
-
-            # Step 54: M.idx[4] + N.idx[0] + O.hash[8] + P.hash[5:7]
-            body.append(m_idx[4])
-            body.append(n_idx[0])
-            body.append(o_hash[8])
-            body.append(p_hash[5])
-            body.append(p_hash[6])
-
-            # Step 55: N.idx[1] + O.hash[9:11] + P.hash[7]
-            body.append(n_idx[1])
-            body.append(o_hash[9])
-            body.append(o_hash[10])
-            body.append(p_hash[7])
-
-            # Step 56: N.idx[2] + O.hash[11] + P.hash[8]
-            body.append(n_idx[2])
-            body.append(o_hash[11])
-            body.append(p_hash[8])
-
-            # Step 57: N.idx[3] + O.idx[0] + P.hash[9:11]
-            body.append(n_idx[3])
-            body.append(o_idx[0])
-            body.append(p_hash[9])
-            body.append(p_hash[10])
-
-            # Step 58: N.idx[4] + O.idx[1] + P.hash[11]
-            body.append(n_idx[4])
-            body.append(o_idx[1])
-            body.append(p_hash[11])
-
-            # Step 59: O.idx[2] + P.idx[0]
-            body.append(o_idx[2])
-            body.append(p_idx[0])
-
-            # Step 60: O.idx[3] + P.idx[1]
-            body.append(o_idx[3])
-            body.append(p_idx[1])
-
-            # Step 61: O.idx[4] + P.idx[2]
-            body.append(o_idx[4])
-            body.append(p_idx[2])
-
-            # Step 62: P.idx[3]
-            body.append(p_idx[3])
-
-            # Step 63: P.idx[4]
-            body.append(p_idx[4])
+            # Step 50: M.idx[0] + N.hash[7] + O.hash[3] + P.hash[0] [+ na_addr]
+            body.append(m_idx[0]); body.append(n_hash[7]); body.append(o_hash[3]); body.append(p_hash[0])
+            body.extend(na_addr_nl)
+            # Step 51: M.idx[1] + N.hash[8] + O.hash[4] + P.hash[1:3] [+ nb_addr + na_loads[0:2]]
+            body.append(m_idx[1]); body.append(n_hash[8]); body.append(o_hash[4])
+            body.append(p_hash[1]); body.append(p_hash[2])
+            body.extend(nb_addr_nl); body.extend(na_loads_nl[0:2])
+            # Step 52: M.idx[2] + N.hash[9:11] + O.hash[5:7] + P.hash[3] [+ na_loads[2:4]]
+            body.append(m_idx[2]); body.append(n_hash[9]); body.append(n_hash[10])
+            body.append(o_hash[5]); body.append(o_hash[6]); body.append(p_hash[3])
+            body.extend(na_loads_nl[2:4])
+            # Step 53: M.idx[3] + N.hash[11] + O.hash[7] + P.hash[4] [+ na_loads[4:6]]
+            body.append(m_idx[3]); body.append(n_hash[11]); body.append(o_hash[7]); body.append(p_hash[4])
+            body.extend(na_loads_nl[4:6])
+            # Step 54: M.idx[4] + N.idx[0] + O.hash[8] + P.hash[5:7] [+ na_loads[6:8]]
+            body.append(m_idx[4]); body.append(n_idx[0]); body.append(o_hash[8])
+            body.append(p_hash[5]); body.append(p_hash[6]); body.extend(na_loads_nl[6:8])
+            # Step 55: N.idx[1] + O.hash[9:11] + P.hash[7] [+ nb_loads[0:2] + nc_addr]
+            body.append(n_idx[1]); body.append(o_hash[9]); body.append(o_hash[10]); body.append(p_hash[7])
+            body.extend(nb_loads_nl[0:2]); body.extend(nc_addr_nl)
+            # Step 56: N.idx[2] + O.hash[11] + P.hash[8] [+ nb_loads[2:4]]
+            body.append(n_idx[2]); body.append(o_hash[11]); body.append(p_hash[8])
+            body.extend(nb_loads_nl[2:4])
+            # Step 57: N.idx[3] + O.idx[0] + P.hash[9:11] [+ nb_loads[4:6]]
+            body.append(n_idx[3]); body.append(o_idx[0]); body.append(p_hash[9]); body.append(p_hash[10])
+            body.extend(nb_loads_nl[4:6])
+            # Step 58: N.idx[4] + O.idx[1] + P.hash[11] [+ nb_loads[6:8]]
+            body.append(n_idx[4]); body.append(o_idx[1]); body.append(p_hash[11])
+            body.extend(nb_loads_nl[6:8])
+            # Step 59: O.idx[2] + P.idx[0] [+ nc_loads[0:2]]
+            body.append(o_idx[2]); body.append(p_idx[0]); body.extend(nc_loads_nl[0:2])
+            # Step 60: O.idx[3] + P.idx[1] [+ nc_loads[2:4]]
+            body.append(o_idx[3]); body.append(p_idx[1]); body.extend(nc_loads_nl[2:4])
+            # Step 61: O.idx[4] + P.idx[2] [+ nc_loads[4:6]]
+            body.append(o_idx[4]); body.append(p_idx[2]); body.extend(nc_loads_nl[4:6])
+            # Step 62: P.idx[3] [+ nc_loads[6:8]]
+            body.append(p_idx[3]); body.extend(nc_loads_nl[6:8])
+            # Step 63: P.idx[4] [+ nd_addr]
+            body.append(p_idx[4]); body.extend(nd_addr_nl)
 
         # --- No-load hextet with arithmetic vselect for round_mod==1 ---
         def emit_hextet_vselect2(body, grp_start, nv_bcast1, nv_bcast2, diff_vec):
@@ -2387,9 +2364,7 @@ class KernelBuilder:
 
                 def emit_hextet_body_steps3_63(body, s, next_round_s0=None, emit_tail=True):
                     """Emit hextet steps 3-63 (skipping A head: addr and loads already done).
-                    Used for hextet1 when its A head was emitted during hextet0's tail.
-                    If next_round_s0 is provided, the tail (steps 50-63) will also prefetch
-                    the next round's hextet0 A.addr+A.loads+B.addr+B.loads+C.addr+C.loads+D.addr.
+                    If next_round_s0 is provided, the tail will prefetch next round's hextet0 head.
                     If emit_tail=False, only steps 3-49 are emitted (caller handles the tail)."""
                     a_loads=s['a_loads']; b_loads=s['b_loads']; c_loads=s['c_loads']; d_loads=s['d_loads']
                     e_loads=s['e_loads']; f_loads=s['f_loads']; g_loads=s['g_loads']; h_loads=s['h_loads']
