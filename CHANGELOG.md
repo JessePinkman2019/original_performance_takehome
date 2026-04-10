@@ -11,9 +11,54 @@
 | 8-group octet 流水线 | 3,344 | 44.2x |
 | 16-group hextet 流水线 + setup 打包 | 3,132 | 47.2x |
 | 早期 round 特判 (mod 0/1) | 2,966 | 49.8x |
-| **早期 round 特判 (mod 0/1/2)** | **2,908** | **50.8x** |
+| 早期 round 特判 (mod 0/1/2) | 2,908 | 50.8x |
+| **hextet 跨边界 tail/head 重叠** | **2,668** | **55.4x** |
 
-通过测试：`test_baseline_60x` + `test_baseline_15x` + `test_round4_combined`（< 2975）
+通过测试：`test_baseline_60x` + `test_baseline_15x` + `test_round4_combined`（< 2975），threshold < 2763（passed）
+
+---
+
+## Round 7: hextet 跨边界 tail/head 重叠优化 (2026-04-10)
+
+- 候选 007a（inter-hextet tail/head overlap）: **2,668 cycles** — ACCEPT，merged（commit cf65700）
+- 改进：2,908 → 2,668 cycles（8.25% 降低，55.4x over 147,734 baseline）
+- 通过门槛：< 2,763（= 2908 × 0.95）✓
+
+### 007a 技术细节
+- **hextet0 尾巴预取 hextet1 头部**：在 hextet0 的 steps 50-63（P 组 hash+idx 尾巴阶段，valu 引擎空闲 ~5 slots/cycle），同时启动 hextet1 的 A/B/C/D 组 addr+load（load 引擎此时空闲）
+- **hextet1 → hextet0 跨 round 预取**：hextet1 尾巴同样预取下一 normal round 的 hextet0 头部（A/B/C/D.addr + A.loads[:8]）
+- **mod2 特判 tail 预取**：mod2（arith4）hextet 的尾巴也预取下一 normal round 的头部
+- 净效果：每轮从 2 个独立的 ~80c hextet 降至约 77c 的重叠结构，合 154c/round（理论）vs 160c 实测减为约 153c/2hextets（整体 160→？，精确见数据）
+
+### Cycle 分解（实测，16 rounds）
+| 类型 | rounds 数量 | 总 cycles |
+|------|-------------|----------|
+| Setup + round mod0(0) | — | 314c |
+| mod0 round(11) | 1 | +160c |
+| mod1 rounds | 2（round 1, 12）| +280c（140c×2） |
+| mod2 rounds | 2（round 2, 13）| +314c（174+140） |
+| normal rounds (mod3-10, mod3-4) | 10 | +1600c（160c×10） |
+| **合计** | | **2668c** |
+
+### Scratch 使用
+- scratch_ptr = 1431 / 1536（**105 words 剩余**，≈ 13 VLEN=8 向量）
+
+### Round 8 瓶颈分析
+
+| 指标 | 数值 |
+|------|------|
+| Normal hextet 实际 | **80 cycles** |
+| 理论最小（load bound） | **64 cycles**（128 load_offset / 2 slots） |
+| 当前 overhead | 16 cycles/hextet |
+| 正常 round 代价 | 160c / round（2 hextets） |
+| 理论最小 round | 128c / round |
+| 节省潜力（10 normal rounds） | ~320 cycles → projected ~2348 |
+
+**到 1487 需要减少 1181 cycles**：
+- 10 normal rounds 优化至理论下界 → -320c → 2348
+- 2 mod2 rounds 优化 → 还有约 -60c → 2288
+- 2 mod1 rounds → 已近优，-10c
+- 仍需 -800c 以上：当前架构无法实现
 
 ---
 

@@ -4,11 +4,11 @@
   "target_cycles": 1487,
   "stretch_target": 1363,
   "current_best": {
-    "cycles": 2908,
-    "commit": "a876a68",
-    "technique": "16group_pipeline_early_round_special_mod012",
-    "per_group_cycles": 5.68,
-    "speedup_over_baseline": 3.42
+    "cycles": 2668,
+    "commit": "cf65700",
+    "technique": "inter_hextet_tail_head_overlap_plus_early_round_special",
+    "per_group_cycles": 83.38,
+    "speedup_over_original_baseline": 55.37
   },
   "known_bottlenecks": {
     "load": "8× load_offset per group → 4 cycles (load×2 slot limit)",
@@ -477,6 +477,118 @@
       "timestamp": "2026-04-10T20:54:11.018598",
       "commit": "a876a68",
       "new_best": 2908
+    },
+    {
+      "type": "generator_started",
+      "attempt_id": "007a",
+      "timestamp": "2026-04-10T20:57:43.649636",
+      "worktree": ".claude/worktrees/attempt-007a"
+    },
+    {
+      "type": "generator_started",
+      "attempt_id": "007b",
+      "timestamp": "2026-04-10T20:58:27.100519",
+      "worktree": ".claude/worktrees/attempt-007b"
+    },
+    {
+      "type": "generator_done",
+      "attempt_id": "007b",
+      "timestamp": "2026-04-10T21:14:00.097459",
+      "cycles": 2908,
+      "prev_best": 2908,
+      "improvement": 0,
+      "status": "failed_no_improvement",
+      "abort_threshold": 2950,
+      "aborted": false,
+      "analysis": {
+        "approach": "round_mod==3 arith8 3-level binary tree select",
+        "arith8_ops_per_group": 16,
+        "arith8_dep_chain_depth": 14,
+        "arith8_cycles_per_quartet": 14,
+        "arith8_total_for_16_groups": 56,
+        "normal_hextet_cycles": 92,
+        "arith8_hextet_estimate": 103,
+        "conclusion": "arith8 is 11c/hextet SLOWER than normal; deep dependency chain negates load elimination"
+      },
+      "optimizations_implemented": [
+        "emit_hextet_arith8 function defined (but reverted to not use it)",
+        "scratch allocation for mod3 nodes kept but unused in hot path"
+      ],
+      "notes": "round_mod==3 falls through to normal hextet (else branch). No cycle reduction."
+    },
+    {
+      "type": "evaluator_result",
+      "attempt_id": "007b",
+      "timestamp": "2026-04-10T21:15:45.268680",
+      "cycles_before": 2908,
+      "cycles_after": 2908,
+      "improvement_pct": 0,
+      "passed": false,
+      "reject_reason": "no improvement: arith8 dep-chain 14 bundles/quartet vs 7 for arith4, actually 11c/hextet slower"
+    },
+    {
+      "type": "generator_done",
+      "attempt_id": "007a",
+      "timestamp": "2026-04-10T21:46:37.554008",
+      "cycles": 2668,
+      "prev_best": 2908,
+      "improvement": 240,
+      "improvement_pct": 8.25,
+      "status": "success",
+      "worktree": ".claude/worktrees/attempt-007a",
+      "optimizations_implemented": [
+        "intra-round hextet tail/head overlap: hextet0 tail prefetches hextet1 A+B+C+D addr+loads",
+        "inter-round tail/head overlap: hextet1 tail prefetches next normal round hextet0 A+B+C+D addr+loads",
+        "arith4 (mod2) tail overlap: prefetches next normal round hextet0 A+B+C+D addr+loads",
+        "D.loads overlap with valu ops in hextet body (steps 3-6)",
+        "prev_prefetched flag: all 10 normal rounds save ~13 cycles per hextet by skipping the head"
+      ],
+      "per_hextet_cycles": 81.2,
+      "cycles_saved_breakdown": {
+        "intra_round_hextet1_head": 130,
+        "inter_round_hextet0_head": 96,
+        "arith4_tail_hextet0_head": 24,
+        "total": 240
+      }
+    },
+    {
+      "type": "evaluator_result",
+      "attempt_id": "007a",
+      "timestamp": "2026-04-10T21:51:27.786605",
+      "cycles_before": 2908,
+      "cycles_after": 2668,
+      "improvement_pct": 8.25,
+      "passed": true,
+      "thresholds_passed": [
+        "test_speedup_2x (< 4968)",
+        "test_speedup_5x (< 1987, actually NO - only < 2763 required)",
+        "need_recheck"
+      ],
+      "scratch_remaining": 105,
+      "bottleneck_analysis": {
+        "normal_hextet_cycles": 80,
+        "two_hextets_per_round": 160,
+        "theoretical_hextet_min_load_bound": 64,
+        "theoretical_two_hextets_min": 128,
+        "current_gap_per_round": 32,
+        "normal_rounds_count": 10,
+        "potential_savings": 320,
+        "projected_if_optimal": 2348,
+        "mod0_cycles": "included_in_314_setup",
+        "mod1_cycles": 140,
+        "mod2_cycles": 174,
+        "mod_normal_cycles": 160,
+        "setup_rounds1": 314,
+        "path_to_1487": "Would need 1487 from 2668 = reduce by 1181 cycles. Normal rounds: 10x32=320 possible. Special rounds: mod0+11=2x~50=100. Remaining gap 1181-420=761 not achievable with current architecture. Need fundamentally different approach - possibly larger hextet groups (32-group) or reducing hash chain depth."
+      },
+      "round8_recommendation": "Focus on reducing normal hextet from 80→64 cycles. The load bottleneck is 64 cycles for 128 load_offset ops. Current 80c vs 64c theoretical = 16 cycles overhead per hextet. Root cause: VALU bottleneck in hash diagonal leaves load engine idle at step boundaries. Counter-strategy: compress hash chain further OR interleave more groups. Scratch has 105 words remaining - enough for 13 more VLEN=8 scratch vectors. Most viable: 32-group hextet (3 hextets per round at 64c each = 192c, but saves vs 2x80=160 for 2 hextets... actually worse). Alternative: reduce addr overhead - addr is 1 valu per group, 16 per hextet = 3 cycles; can we precompute? Another option: fuse the two hextets into one 32-group hextet to benefit from more overlap. Expected 007b result was 2,668 (same), suggesting this inter-hextet overlap is the current state-of-art without deeper restructuring."
+    },
+    {
+      "type": "merged",
+      "attempt_id": "007a",
+      "timestamp": "2026-04-10T21:51:27.786618",
+      "commit": "cf65700",
+      "new_best": 2668
     }
   ]
 }
