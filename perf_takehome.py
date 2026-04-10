@@ -260,6 +260,7 @@ class KernelBuilder:
         one_scalar = self.alloc_scratch("one_scalar")
         two_scalar = self.alloc_scratch("two_scalar")
         zero_scalar = self.alloc_scratch("zero_scalar")
+        three_scalar = self.alloc_scratch("three_scalar_const")
 
         sc_mul_4097 = self.alloc_scratch("mul_4097")
         sc_hash0_const = self.alloc_scratch("hash0_const")
@@ -278,6 +279,7 @@ class KernelBuilder:
         self.const_map[1] = one_scalar
         self.const_map[2] = two_scalar
         self.const_map[0] = zero_scalar
+        self.const_map[3] = three_scalar
         self.const_map[4097] = sc_mul_4097
         self.const_map[0x7ED55D16] = sc_hash0_const
         self.const_map[0xC761C23C] = sc_hash1_const
@@ -294,13 +296,13 @@ class KernelBuilder:
         # Load all scalar constants packed 2/cycle
         const_loads = [
             (one_scalar, 1), (two_scalar, 2),
-            (zero_scalar, 0), (sc_mul_4097, 4097),
-            (sc_hash0_const, 0x7ED55D16), (sc_hash1_const, 0xC761C23C),
-            (sc_shift_19, 19), (sc_mul_33, 33),
-            (sc_hash2_const, 0x165667B1), (sc_hash3_const, 0xD3A2646C),
-            (sc_shift_9, 9), (sc_mul_9, 9),
-            (sc_hash4_const, 0xFD7046C5), (sc_hash5_const, 0xB55A4F09),
-            (sc_shift_16, 16),
+            (zero_scalar, 0), (three_scalar, 3),
+            (sc_mul_4097, 4097), (sc_hash0_const, 0x7ED55D16),
+            (sc_hash1_const, 0xC761C23C), (sc_shift_19, 19),
+            (sc_mul_33, 33), (sc_hash2_const, 0x165667B1),
+            (sc_hash3_const, 0xD3A2646C), (sc_shift_9, 9),
+            (sc_mul_9, 9), (sc_hash4_const, 0xFD7046C5),
+            (sc_hash5_const, 0xB55A4F09), (sc_shift_16, 16),
         ]
         for i in range(0, len(const_loads), 2):
             pair = const_loads[i:i+2]
@@ -386,11 +388,24 @@ class KernelBuilder:
         nv_scalar_r0 = self.alloc_scratch("nv_scalar_r0", 1)    # single scalar node value
         nv_bcast_r0 = self.alloc_scratch("nv_bcast_r0", VLEN)   # broadcast vector for round 0/11
 
-        # round_mod==1: idx in {1,2}, two scalar loads + per-group vselect
+        # round_mod==1: idx in {1,2}, two scalar loads + per-group arithmetic vselect
         nv_node1_r1 = self.alloc_scratch("nv_node1_r1", 1)      # node at fvp+1
         nv_node2_r1 = self.alloc_scratch("nv_node2_r1", 1)      # node at fvp+2
         nv_bcast1_r1 = self.alloc_scratch("nv_bcast1_r1", VLEN) # broadcast of node1
         nv_bcast2_r1 = self.alloc_scratch("nv_bcast2_r1", VLEN) # broadcast of node2
+        diff_r1_vec = self.alloc_scratch("diff_r1_vec", VLEN)   # node1 - node2 (for arithmetic select)
+
+        # round_mod==2: idx in {3,4,5,6}, 4-node arithmetic select
+        nv_node3_r2 = self.alloc_scratch("nv_node3_r2", 1)      # node at fvp+3
+        nv_node4_r2 = self.alloc_scratch("nv_node4_r2", 1)      # node at fvp+4
+        nv_node5_r2 = self.alloc_scratch("nv_node5_r2", 1)      # node at fvp+5
+        nv_node6_r2 = self.alloc_scratch("nv_node6_r2", 1)      # node at fvp+6
+        node3_bcast = self.alloc_scratch("node3_bcast", VLEN)   # broadcast of node3
+        node5_bcast = self.alloc_scratch("node5_bcast", VLEN)   # broadcast of node5
+        diff34_bcast = self.alloc_scratch("diff34_bcast", VLEN) # node4 - node3
+        diff56_bcast = self.alloc_scratch("diff56_bcast", VLEN) # node6 - node5
+        # three_scalar is already allocated above (in const section)
+        three_vec = self.alloc_scratch("three_vec", VLEN)       # broadcast 3
 
         # Scratch check
         assert self.scratch_ptr <= SCRATCH_SIZE, f"Scratch overflow: {self.scratch_ptr} > {SCRATCH_SIZE}"
@@ -962,13 +977,19 @@ class KernelBuilder:
             # Step 63: P.idx[4]
             body.append(p_idx[4])
 
-        # --- No-load hextet with vselect for round_mod==1 ---
-        def emit_hextet_vselect2(body, grp_start, nv_bcast1, nv_bcast2):
-            """Emit 16-group hextet using per-group arithmetic to choose between 2 nodes.
-            Uses addr_tmp_g[g] as per-group scratch for lsb_cond (each group has its own).
-            This avoids the pair-sharing WAW hazard.
+        # --- No-load hextet with arithmetic vselect for round_mod==1 ---
+        def emit_hextet_vselect2(body, grp_start, nv_bcast1, nv_bcast2, diff_vec):
+            """Emit 16-group hextet using pure valu arithmetic to choose between 2 nodes.
+            Uses addr_tmp_g[g] as per-group lsb storage (each group has its own → no sharing).
             nv_bcast1 = forest_values[1] (for idx=1, lsb=1)
             nv_bcast2 = forest_values[2] (for idx=2, lsb=0)
+            diff_vec = nv_bcast1 - nv_bcast2 (precomputed)
+
+            Arithmetic select: nv = nv_bcast2 + lsb * (nv_bcast1 - nv_bcast2)
+                             = multiply_add(nv_bcast2_r1, lsb, diff_vec, nv_bcast2)
+            When lsb=1: nv = diff + nv2 = nv1 ✓
+            When lsb=0: nv = 0 + nv2 = nv2 ✓
+            No flow engine usage → 16 groups can be pipelined on valu only.
             """
             gA, gB, gC, gD = grp_start, grp_start+1, grp_start+2, grp_start+3
             gE, gF, gG, gH = grp_start+4, grp_start+5, grp_start+6, grp_start+7
@@ -979,41 +1000,41 @@ class KernelBuilder:
             pI, pJ, pK, pL = 0, 1, 2, 3
             pM, pN, pO, pP = 0, 1, 2, 3
 
-            # For vselect2: use addr_tmp_g[g] as per-group lsb_cond storage.
-            # addr_tmp_g[g] has VLEN words, each group has its own → no sharing conflicts.
-            # flow vselect reads cond[0..VLEN-1].
-            # Emit: lsb_cond[g] = idx[g] & 1  (valu, to addr_tmp_g[g])
-            #        nv[g] = vselect(lsb_cond[g], nv_bcast1, nv_bcast2)  (flow, to nv_tmp_g[g])
-            #        val[g] ^= nv[g]  (valu)
-            # Then hash+idx in normal diagonal order.
+            # Per-group arithmetic select slots (2 valu ops each):
+            # Step 1: lsb_g = idx_g & 1 → addr_tmp_g[g]
+            # Step 2: nv_g = multiply_add(lsb_g, diff_vec, nv_bcast2) → nv_tmp_g[g]
+            # Step 3: val_g ^= nv_g
+            # Total: 3 valu ops/group, no flow dependency chain.
+            # Groups can interleave freely on valu engine (6 slots/cycle).
 
-            def xor_vsel_slots(g):
+            def xor_arith_slots(g):
                 idx_s = idx_base + g * VLEN
                 val_s = val_base + g * VLEN
-                lsb_cond = addr_tmp_g[g]  # per-group, no sharing!
+                lsb = addr_tmp_g[g]  # per-group lsb storage
                 nv = nv_tmp_g[g]
                 return [
-                    ("valu", ("&", lsb_cond, idx_s, one_vec)),
-                    ("flow", ("vselect", nv, lsb_cond, nv_bcast1, nv_bcast2)),
+                    ("valu", ("&", lsb, idx_s, one_vec)),
+                    # nv = lsb * (node1-node2) + node2 = node2 + lsb*(node1-node2)
+                    ("valu", ("multiply_add", nv, lsb, diff_vec, nv_bcast2)),
                     ("valu", ("^", val_s, val_s, nv)),
                 ]
 
-            a_xvs = xor_vsel_slots(gA)
-            b_xvs = xor_vsel_slots(gB)
-            c_xvs = xor_vsel_slots(gC)
-            d_xvs = xor_vsel_slots(gD)
-            e_xvs = xor_vsel_slots(gE)
-            f_xvs = xor_vsel_slots(gF)
-            g_xvs = xor_vsel_slots(gG)
-            h_xvs = xor_vsel_slots(gH)
-            i_xvs = xor_vsel_slots(gI)
-            j_xvs = xor_vsel_slots(gJ)
-            k_xvs = xor_vsel_slots(gK)
-            l_xvs = xor_vsel_slots(gL)
-            m_xvs = xor_vsel_slots(gM)
-            n_xvs = xor_vsel_slots(gN)
-            o_xvs = xor_vsel_slots(gO)
-            p_xvs = xor_vsel_slots(gP)
+            a_xas = xor_arith_slots(gA)
+            b_xas = xor_arith_slots(gB)
+            c_xas = xor_arith_slots(gC)
+            d_xas = xor_arith_slots(gD)
+            e_xas = xor_arith_slots(gE)
+            f_xas = xor_arith_slots(gF)
+            g_xas = xor_arith_slots(gG)
+            h_xas = xor_arith_slots(gH)
+            i_xas = xor_arith_slots(gI)
+            j_xas = xor_arith_slots(gJ)
+            k_xas = xor_arith_slots(gK)
+            l_xas = xor_arith_slots(gL)
+            m_xas = xor_arith_slots(gM)
+            n_xas = xor_arith_slots(gN)
+            o_xas = xor_arith_slots(gO)
+            p_xas = xor_arith_slots(gP)
 
             a_hash = group_hash_slots(gA, pA)
             b_hash = group_hash_slots(gB, pB)
@@ -1049,32 +1070,15 @@ class KernelBuilder:
             o_idx = group_idx_slots(gO, pO)
             p_idx = group_idx_slots(gP, pP)
 
-            # Emit xor_vsel for all 16 groups first (interleaved for max packing)
-            # Each xor_vsel is 3 slots: valu, flow, valu. Flow is 1/cycle so this
-            # will serialize on the flow engine (16 flow ops = 16 cycles minimum).
-            # But we can interleave: emit all "lsb=idx&1" first (16 valu), then vselects,
-            # then val^=nv. This allows valu ops to pack while flow serializes.
-            # Actually: lsb[A] → vselect[A] → val^=[A] must be ordered (RAW).
-            # So we can't fully parallelize. Best: interleave groups to fill valu slots
-            # between flow vselects.
-
-            # Interleaved emission: for each group, emit its 3 xvs slots.
-            # The build() packer will pack independent ops (different groups) together.
-            # lsb[A] can be packed with lsb[B] (no conflict), then vselect[A] alone,
-            # then vselect[B] alone, etc. But RAW between lsb[A] and vselect[A]...
-            # Actually: lsb[A] in cycle N, vselect[A] must be in cycle N+1 or later.
-            # lsb[B] can be in cycle N too (different scratch). vselect[B] also N+1.
-            # So: pack lsb for many groups in cycle 1, then vselects for them start cycle 2,
-            # but flow only 1/cycle so vselects take 16 cycles.
-            # Meanwhile valu slots (val^=nv) can't start until vselect done (RAW on nv).
-
-            # Most efficient emission for correctness:
-            # Emit all lsb computations together (pack 6/cycle = 3 cycles)
-            # Then interleave vselects with val^= ops from already-done vselects
+            # Emit all lsb computations (16 valu, pack 6/cycle → 3 cycles)
             for g in [gA, gB, gC, gD, gE, gF, gG, gH, gI, gJ, gK, gL, gM, gN, gO, gP]:
                 body.append(("valu", ("&", addr_tmp_g[g], idx_base + g * VLEN, one_vec)))
+            # Emit multiply_add for all groups (16 valu, pack 6/cycle → 3 cycles)
+            # Each reads addr_tmp_g[g] (written in above), but different groups independent
             for g in [gA, gB, gC, gD, gE, gF, gG, gH, gI, gJ, gK, gL, gM, gN, gO, gP]:
-                body.append(("flow", ("vselect", nv_tmp_g[g], addr_tmp_g[g], nv_bcast1, nv_bcast2)))
+                body.append(("valu", ("multiply_add", nv_tmp_g[g], addr_tmp_g[g], diff_vec, nv_bcast2)))
+            # Emit xor for all groups (16 valu, pack 6/cycle → 3 cycles)
+            for g in [gA, gB, gC, gD, gE, gF, gG, gH, gI, gJ, gK, gL, gM, gN, gO, gP]:
                 body.append(("valu", ("^", val_base + g * VLEN, val_base + g * VLEN, nv_tmp_g[g])))
 
             # Hash+idx in normal diagonal order (same as emit_hextet_noload but without xors)
@@ -1351,6 +1355,549 @@ class KernelBuilder:
             body.append(p_idx[3])
             body.append(p_idx[4])
 
+        # --- No-load hextet with 4-node arithmetic select for round_mod==2 ---
+        def emit_hextet_arith4(body, grp_start, node3_b, node5_b, diff34_b, diff56_b):
+            """Emit 16-group hextet using pure valu arithmetic to select from 4 nodes.
+            idx ∈ {3,4,5,6}, sub = idx-3 ∈ {0,1,2,3}.
+            bit0 = sub & 1 = (idx+1) & 1 (since idx-3 ≡ idx+1 mod 2, verify below)
+            bit1 = sub >> 1 (right-shift by 1 on {0,1,2,3} gives {0,0,1,1})
+
+            idx=3: sub=0, bit0=0, bit1=0 → lo=node3, hi=node5 → nv=lo=node3 ✓
+            idx=4: sub=1, bit0=1, bit1=0 → lo=node3+diff34=node4, hi=node5+diff56=node6 → nv=lo=node4 ✓
+            idx=5: sub=2, bit0=0, bit1=1 → lo=node3, hi=node5 → nv=lo+(hi-lo)*1=hi=node5 ✓
+            idx=6: sub=3, bit0=1, bit1=1 → lo=node4, hi=node6 → nv=hi=node6 ✓
+
+            Per-group operations (8 valu steps):
+              sub = idx - three_vec           (addr_tmp_g[g])
+              bit0 = sub & one_vec             (lsb_tmp_pair[p])
+              bit1 = sub >> one_vec            (cmp_tmp_pair[p])
+              lo = multiply_add(bit0, diff34_b, node3_b)  (t1_tmp_pair[p])
+              hi = multiply_add(bit0, diff56_b, node5_b)  (t2_tmp_pair[p])
+              diff_lohi = hi - lo              (addr_tmp_g[g], reuse)
+              nv = multiply_add(bit1, diff_lohi, lo)     (t1_tmp_pair[p])
+              val ^= nv
+            """
+            gA, gB, gC, gD = grp_start, grp_start+1, grp_start+2, grp_start+3
+            gE, gF, gG, gH = grp_start+4, grp_start+5, grp_start+6, grp_start+7
+            gI, gJ, gK, gL = grp_start+8, grp_start+9, grp_start+10, grp_start+11
+            gM, gN, gO, gP = grp_start+12, grp_start+13, grp_start+14, grp_start+15
+            pA, pB, pC, pD = 0, 1, 2, 3
+            pE, pF, pG, pH = 0, 1, 2, 3
+            pI, pJ, pK, pL = 0, 1, 2, 3
+            pM, pN, pO, pP = 0, 1, 2, 3
+
+            # Per-group arithmetic 4-node select slots
+            # Uses pair-indexed scratch (t1,t2,lsb,cmp) + per-group scratch (addr_tmp_g)
+            def arith4_nv_slots(g, p):
+                idx_s = idx_base + g * VLEN
+                val_s = val_base + g * VLEN
+                sub_s = addr_tmp_g[g]       # per-group, no sharing
+                bit0_s = lsb_tmp_pair[p]    # pair-indexed
+                bit1_s = cmp_tmp_pair[p]    # pair-indexed
+                lo_s = t1_tmp_pair[p]       # pair-indexed
+                hi_s = t2_tmp_pair[p]       # pair-indexed
+                return [
+                    ("valu", ("-", sub_s, idx_s, three_vec)),
+                    ("valu", ("&", bit0_s, sub_s, one_vec)),
+                    ("valu", (">>", bit1_s, sub_s, one_vec)),
+                    # lo = bit0 * diff34 + node3
+                    ("valu", ("multiply_add", lo_s, bit0_s, diff34_b, node3_b)),
+                    # hi = bit0 * diff56 + node5
+                    ("valu", ("multiply_add", hi_s, bit0_s, diff56_b, node5_b)),
+                    # diff_lohi = hi - lo → reuse sub_s (sub already consumed by bit0,bit1)
+                    ("valu", ("-", sub_s, hi_s, lo_s)),
+                    # nv = bit1 * diff_lohi + lo → reuse lo_s
+                    ("valu", ("multiply_add", lo_s, bit1_s, sub_s, lo_s)),
+                    # val ^= nv
+                    ("valu", ("^", val_s, val_s, lo_s)),
+                ]
+
+            a_a4 = arith4_nv_slots(gA, pA)
+            b_a4 = arith4_nv_slots(gB, pB)
+            c_a4 = arith4_nv_slots(gC, pC)
+            d_a4 = arith4_nv_slots(gD, pD)
+            e_a4 = arith4_nv_slots(gE, pE)
+            f_a4 = arith4_nv_slots(gF, pF)
+            g_a4 = arith4_nv_slots(gG, pG)
+            h_a4 = arith4_nv_slots(gH, pH)
+            i_a4 = arith4_nv_slots(gI, pI)
+            j_a4 = arith4_nv_slots(gJ, pJ)
+            k_a4 = arith4_nv_slots(gK, pK)
+            l_a4 = arith4_nv_slots(gL, pL)
+            m_a4 = arith4_nv_slots(gM, pM)
+            n_a4 = arith4_nv_slots(gN, pN)
+            o_a4 = arith4_nv_slots(gO, pO)
+            p_a4 = arith4_nv_slots(gP, pP)
+
+            a_hash = group_hash_slots(gA, pA)
+            b_hash = group_hash_slots(gB, pB)
+            c_hash = group_hash_slots(gC, pC)
+            d_hash = group_hash_slots(gD, pD)
+            e_hash = group_hash_slots(gE, pE)
+            f_hash = group_hash_slots(gF, pF)
+            g_hash = group_hash_slots(gG, pG)
+            h_hash = group_hash_slots(gH, pH)
+            i_hash = group_hash_slots(gI, pI)
+            j_hash = group_hash_slots(gJ, pJ)
+            k_hash = group_hash_slots(gK, pK)
+            l_hash = group_hash_slots(gL, pL)
+            m_hash = group_hash_slots(gM, pM)
+            n_hash = group_hash_slots(gN, pN)
+            o_hash = group_hash_slots(gO, pO)
+            p_hash = group_hash_slots(gP, pP)
+
+            a_idx = group_idx_slots(gA, pA)
+            b_idx = group_idx_slots(gB, pB)
+            c_idx = group_idx_slots(gC, pC)
+            d_idx = group_idx_slots(gD, pD)
+            e_idx = group_idx_slots(gE, pE)
+            f_idx = group_idx_slots(gF, pF)
+            g_idx = group_idx_slots(gG, pG)
+            h_idx = group_idx_slots(gH, pH)
+            i_idx = group_idx_slots(gI, pI)
+            j_idx = group_idx_slots(gJ, pJ)
+            k_idx = group_idx_slots(gK, pK)
+            l_idx = group_idx_slots(gL, pL)
+            m_idx = group_idx_slots(gM, pM)
+            n_idx = group_idx_slots(gN, pN)
+            o_idx = group_idx_slots(gO, pO)
+            p_idx = group_idx_slots(gP, pP)
+
+            # Emit arith4_nv for all 16 groups in diagonal order.
+            # Each group has 8 valu ops with dependency chain:
+            #   sub(1) -> bit0,bit1(2) -> lo,hi(3) -> diff_lohi(4) -> nv(5) -> val^=nv(6)
+            # Across groups: same step is independent → pack groups in same cycle.
+            # Pair constraint: groups A,E,I,M share pair 0; B,F,J,N share pair 1, etc.
+            # Steps 2-7 use pair scratch. Must not use pair 0 simultaneously for A and E.
+            # Solution: interleave A-D steps with E-H steps offset by 4 steps,
+            # same as the noload hextet diagonal. Here we use a compact approach:
+            # emit steps for all 4 groups (A-D) first, then E-H delayed by 4 cycles, etc.
+
+            # Compact diagonal: emit step k for groups [gX] where X's step k is ready.
+            # A-D do steps 0-7, E-H do steps 0-7 (offset by when pairs free), etc.
+            # Most straightforward: each group's 8 steps in order, interleaved across 4 groups
+            # per quartet so pair reuse is safe.
+
+            # ABCD quartet: all use different pairs (pA=0,pB=1,pC=2,pD=3)
+            # → all 4 steps can run simultaneously for same step index
+            # EFGH also pE=0,pF=1,pG=2,pH=3 → conflict with ABCD on pairs!
+            # But EFGH starts step 2 only after ABCD finishes step 1+ (pairs consumed)
+            # Actually: pair scratch is read (not written) by arith4 sub-step 2 (bit0/bit1)
+            # and written in step 2. ABCD writes to pair 0-3 at step 2 cycle.
+            # EFGH also writes to pair 0-3 at step 2 — but if in the same cycle that's WAW conflict!
+            # So we need EFGH to start its arith4 AFTER ABCD's step 1 (sub) finishes.
+            # ABCD step 1 (sub) doesn't use pair scratch. Only step 2+ does.
+            # So EFGH step 1 can overlap with ABCD step 1 (sub uses different addr_tmp_g).
+
+            # Emission plan (by step within arith4):
+            # Cycle X:   A.sub, B.sub, C.sub, D.sub, E.sub, F.sub (6 valu slots = 1 cycle)
+            # Cycle X+1: G.sub, H.sub, I.sub, J.sub, K.sub, L.sub
+            # Cycle X+2: M.sub, N.sub, O.sub, P.sub + A.bit0, A.bit1 (but pair conflict?)
+            #
+            # Actually since all subs write to different addr_tmp_g[g], they're all independent.
+            # So all 16 subs can emit in 3 cycles (16/6 = 3).
+            # Then for bit0/bit1: A-D use pairs 0-3, E-H also use pairs 0-3 → conflict!
+            # Solution: emit bit0/bit1 in two separate batches: ABCD first, then EFGH, IJKL, MNOP.
+            # Within each batch of 4, bit0 and bit1 for same group need 2 slots but same pair
+            # → they can be in same bundle since they write to different scratch.
+            # Wait: pA=0 → lsb_tmp_pair[0] and cmp_tmp_pair[0]. Different scratch, so both
+            # bit0_A and bit1_A can be in same cycle. Also bit0_B (pair 1) and bit1_B.
+            # → All 8 (bit0+bit1) for ABCD can go in 1-2 cycles (4 groups × 2 ops = 8 ops, 2 cycles).
+            # Similarly for EFGH etc.
+            # But EFGH bit0/bit1 conflict with ABCD if in same cycle → must wait for ABCD to finish.
+
+            # Simple safe strategy: emit all 16 arith4_nv groups step by step, with
+            # ABCD group at each step, then EFGH, IJKL, MNOP. Since ABCD has different
+            # pairs from... wait they all reuse pairs 0-3!
+            # Conflict resolution: within same step, only groups with different pairs can coexist.
+            # A uses pair 0, E uses pair 0 → cannot be in same cycle for steps 2-7.
+            # B uses pair 1, F uses pair 1 → same constraint.
+            # So at step 2 (bit0/bit1), emit A,B,C,D first (4 groups, 8 ops, 2 cycles),
+            # then E,F,G,H (after A,B,C,D clear pair reuse), etc.
+            # But actually: A.step2 writes lsb_pair[0] and cmp_pair[0]. E.step2 also writes them.
+            # If A.step2 is in cycle N and E.step2 in cycle N+1, that's fine (no conflict).
+
+            # Cleanest approach: emit in diagonal order ensuring pair safety.
+            # For each step s in 0..7, emit for groups in order A,B,C,D,E,F,G,H,I,J,K,L,M,N,O,P.
+            # This is safe because: at step s, A uses pairs 0; at step s, E also uses pair 0.
+            # The build() packer will put A.step[s] and E.step[s] in the same bundle IF no conflict.
+            # At step 2 (bit0): A writes lsb_pair[0], E writes lsb_pair[0] → WAW conflict → separate cycles.
+            # So A.step2 goes first, E.step2 follows next available cycle. This is safe and automatic.
+
+            # Emit arith4_nv in QUARTET ORDER to ensure pair-reuse safety.
+            # CRITICAL: Groups A,E,I,M all share pair 0. If E.bit0 (writes lsb_pair[0]) is
+            # emitted before A.lo (reads lsb_pair[0]), the packer may schedule E.bit0 first,
+            # causing A.lo to read E's lsb instead of A's. Fix: emit complete quartet
+            # (ABCD steps 0-7) before starting EFGH, which ensures A.lo comes before E.bit0.
+            # Within a quartet, ABCD use different pairs (0,1,2,3), so all 4 can interleave.
+            quartets = [
+                [(gA,pA), (gB,pB), (gC,pC), (gD,pD)],
+                [(gE,pE), (gF,pF), (gG,pG), (gH,pH)],
+                [(gI,pI), (gJ,pJ), (gK,pK), (gL,pL)],
+                [(gM,pM), (gN,pN), (gO,pO), (gP,pP)],
+            ]
+            for quartet in quartets:
+                # Emit all 8 steps for this quartet in step order.
+                # Within each step, emit all 4 groups (different pairs → parallelism).
+                # Step 0: sub (writes addr_tmp_g[g], no pair scratch)
+                for g, p in quartet:
+                    a4 = arith4_nv_slots(g, p)
+                    body.append(a4[0])
+                # Step 1+2: bit0 and bit1 (write lsb_pair[p] and cmp_pair[p])
+                for g, p in quartet:
+                    a4 = arith4_nv_slots(g, p)
+                    body.append(a4[1])  # bit0
+                    body.append(a4[2])  # bit1
+                # Step 3+4: lo and hi (read lsb_pair[p], write t1_pair[p] and t2_pair[p])
+                for g, p in quartet:
+                    a4 = arith4_nv_slots(g, p)
+                    body.append(a4[3])  # lo
+                    body.append(a4[4])  # hi
+                # Step 5: diff_lohi (read t1+t2 pair, write addr_tmp_g[g])
+                for g, p in quartet:
+                    a4 = arith4_nv_slots(g, p)
+                    body.append(a4[5])  # diff_lohi
+                # Step 6: nv (read cmp_pair[p], addr_tmp_g[g], t1_pair[p], write t1_pair[p])
+                for g, p in quartet:
+                    a4 = arith4_nv_slots(g, p)
+                    body.append(a4[6])  # nv
+                # Step 7: val ^= nv (read t1_pair[p], write val_s)
+                for g, p in quartet:
+                    a4 = arith4_nv_slots(g, p)
+                    body.append(a4[7])  # val ^= nv
+
+            # Hash+idx diagonal (same as emit_hextet_noload)
+            body.append(a_hash[0])
+
+            body.append(a_hash[1])
+            body.append(a_hash[2])
+            body.append(b_hash[0])
+
+            body.append(a_hash[3])
+            body.append(b_hash[1])
+            body.append(b_hash[2])
+            body.append(c_hash[0])
+
+            body.append(a_hash[4])
+            body.append(b_hash[3])
+            body.append(c_hash[1])
+            body.append(c_hash[2])
+            body.append(d_hash[0])
+
+            body.append(a_hash[5])
+            body.append(a_hash[6])
+            body.append(b_hash[4])
+            body.append(c_hash[3])
+            body.append(d_hash[1])
+            body.append(d_hash[2])
+
+            body.append(a_hash[7])
+            body.append(b_hash[5])
+            body.append(b_hash[6])
+            body.append(c_hash[4])
+            body.append(d_hash[3])
+
+            body.append(a_hash[8])
+            body.append(b_hash[7])
+            body.append(c_hash[5])
+            body.append(c_hash[6])
+            body.append(d_hash[4])
+
+            body.append(a_hash[9])
+            body.append(a_hash[10])
+            body.append(b_hash[8])
+            body.append(c_hash[7])
+            body.append(d_hash[5])
+            body.append(d_hash[6])
+
+            body.append(a_hash[11])
+            body.append(b_hash[9])
+            body.append(b_hash[10])
+            body.append(c_hash[8])
+            body.append(d_hash[7])
+
+            body.append(a_idx[0])
+            body.append(b_hash[11])
+            body.append(c_hash[9])
+            body.append(c_hash[10])
+            body.append(d_hash[8])
+
+            body.append(a_idx[1])
+            body.append(b_idx[0])
+            body.append(c_hash[11])
+            body.append(d_hash[9])
+            body.append(d_hash[10])
+
+            body.append(a_idx[2])
+            body.append(b_idx[1])
+            body.append(c_idx[0])
+            body.append(d_hash[11])
+
+            body.append(a_idx[3])
+            body.append(b_idx[2])
+            body.append(c_idx[1])
+            body.append(d_idx[0])
+
+            body.append(a_idx[4])
+            body.append(b_idx[3])
+            body.append(c_idx[2])
+            body.append(d_idx[1])
+
+            body.append(b_idx[4])
+            body.append(c_idx[3])
+            body.append(d_idx[2])
+
+            body.append(c_idx[4])
+            body.append(d_idx[3])
+            body.append(e_hash[0])
+
+            body.append(d_idx[4])
+            body.append(e_hash[1])
+            body.append(e_hash[2])
+            body.append(f_hash[0])
+
+            body.append(e_hash[3])
+            body.append(f_hash[1])
+            body.append(f_hash[2])
+            body.append(g_hash[0])
+
+            body.append(e_hash[4])
+            body.append(f_hash[3])
+            body.append(g_hash[1])
+            body.append(g_hash[2])
+            body.append(h_hash[0])
+
+            body.append(e_hash[5])
+            body.append(e_hash[6])
+            body.append(f_hash[4])
+            body.append(g_hash[3])
+            body.append(h_hash[1])
+            body.append(h_hash[2])
+
+            body.append(e_hash[7])
+            body.append(f_hash[5])
+            body.append(f_hash[6])
+            body.append(g_hash[4])
+            body.append(h_hash[3])
+
+            body.append(e_hash[8])
+            body.append(f_hash[7])
+            body.append(g_hash[5])
+            body.append(g_hash[6])
+            body.append(h_hash[4])
+
+            body.append(e_hash[9])
+            body.append(e_hash[10])
+            body.append(f_hash[8])
+            body.append(g_hash[7])
+            body.append(h_hash[5])
+            body.append(h_hash[6])
+
+            body.append(e_hash[11])
+            body.append(f_hash[9])
+            body.append(f_hash[10])
+            body.append(g_hash[8])
+            body.append(h_hash[7])
+
+            body.append(e_idx[0])
+            body.append(f_hash[11])
+            body.append(g_hash[9])
+            body.append(g_hash[10])
+            body.append(h_hash[8])
+
+            body.append(e_idx[1])
+            body.append(f_idx[0])
+            body.append(g_hash[11])
+            body.append(h_hash[9])
+            body.append(h_hash[10])
+
+            body.append(e_idx[2])
+            body.append(f_idx[1])
+            body.append(g_idx[0])
+            body.append(h_hash[11])
+
+            body.append(e_idx[3])
+            body.append(f_idx[2])
+            body.append(g_idx[1])
+            body.append(h_idx[0])
+
+            body.append(e_idx[4])
+            body.append(f_idx[3])
+            body.append(g_idx[2])
+            body.append(h_idx[1])
+
+            body.append(f_idx[4])
+            body.append(g_idx[3])
+            body.append(h_idx[2])
+            body.append(i_hash[0])
+
+            body.append(g_idx[4])
+            body.append(h_idx[3])
+            body.append(i_hash[1])
+            body.append(i_hash[2])
+            body.append(j_hash[0])
+
+            body.append(h_idx[4])
+            body.append(i_hash[3])
+            body.append(j_hash[1])
+            body.append(j_hash[2])
+            body.append(k_hash[0])
+
+            body.append(i_hash[4])
+            body.append(j_hash[3])
+            body.append(k_hash[1])
+            body.append(k_hash[2])
+            body.append(l_hash[0])
+
+            body.append(i_hash[5])
+            body.append(i_hash[6])
+            body.append(j_hash[4])
+            body.append(k_hash[3])
+            body.append(l_hash[1])
+            body.append(l_hash[2])
+
+            body.append(i_hash[7])
+            body.append(j_hash[5])
+            body.append(j_hash[6])
+            body.append(k_hash[4])
+            body.append(l_hash[3])
+
+            body.append(i_hash[8])
+            body.append(j_hash[7])
+            body.append(k_hash[5])
+            body.append(k_hash[6])
+            body.append(l_hash[4])
+            body.append(m_hash[0])
+
+            body.append(i_hash[9])
+            body.append(i_hash[10])
+            body.append(j_hash[8])
+            body.append(k_hash[7])
+            body.append(l_hash[5])
+            body.append(l_hash[6])
+
+            body.append(i_hash[11])
+            body.append(j_hash[9])
+            body.append(j_hash[10])
+            body.append(k_hash[8])
+            body.append(l_hash[7])
+            body.append(m_hash[1])
+
+            body.append(i_idx[0])
+            body.append(j_hash[11])
+            body.append(k_hash[9])
+            body.append(k_hash[10])
+            body.append(l_hash[8])
+            body.append(m_hash[2])
+
+            body.append(i_idx[1])
+            body.append(j_idx[0])
+            body.append(k_hash[11])
+            body.append(l_hash[9])
+            body.append(l_hash[10])
+            body.append(m_hash[3])
+
+            body.append(i_idx[2])
+            body.append(j_idx[1])
+            body.append(k_idx[0])
+            body.append(l_hash[11])
+            body.append(m_hash[4])
+            body.append(n_hash[0])
+
+            body.append(i_idx[3])
+            body.append(j_idx[2])
+            body.append(k_idx[1])
+            body.append(l_idx[0])
+            body.append(m_hash[5])
+            body.append(m_hash[6])
+
+            body.append(i_idx[4])
+            body.append(j_idx[3])
+            body.append(k_idx[2])
+            body.append(l_idx[1])
+            body.append(m_hash[7])
+            body.append(n_hash[1])
+
+            body.append(j_idx[4])
+            body.append(k_idx[3])
+            body.append(l_idx[2])
+            body.append(m_hash[8])
+            body.append(n_hash[2])
+            body.append(n_hash[3])
+
+            body.append(k_idx[4])
+            body.append(l_idx[3])
+            body.append(m_hash[9])
+            body.append(m_hash[10])
+            body.append(n_hash[4])
+            body.append(o_hash[0])
+
+            body.append(l_idx[4])
+            body.append(m_hash[11])
+            body.append(n_hash[5])
+            body.append(n_hash[6])
+            body.append(o_hash[1])
+            body.append(o_hash[2])
+
+            body.append(m_idx[0])
+            body.append(n_hash[7])
+            body.append(o_hash[3])
+            body.append(p_hash[0])
+
+            body.append(m_idx[1])
+            body.append(n_hash[8])
+            body.append(o_hash[4])
+            body.append(p_hash[1])
+            body.append(p_hash[2])
+
+            body.append(m_idx[2])
+            body.append(n_hash[9])
+            body.append(n_hash[10])
+            body.append(o_hash[5])
+            body.append(o_hash[6])
+            body.append(p_hash[3])
+
+            body.append(m_idx[3])
+            body.append(n_hash[11])
+            body.append(o_hash[7])
+            body.append(p_hash[4])
+
+            body.append(m_idx[4])
+            body.append(n_idx[0])
+            body.append(o_hash[8])
+            body.append(p_hash[5])
+            body.append(p_hash[6])
+
+            body.append(n_idx[1])
+            body.append(o_hash[9])
+            body.append(o_hash[10])
+            body.append(p_hash[7])
+
+            body.append(n_idx[2])
+            body.append(o_hash[11])
+            body.append(p_hash[8])
+
+            body.append(n_idx[3])
+            body.append(o_idx[0])
+            body.append(p_hash[9])
+            body.append(p_hash[10])
+
+            body.append(n_idx[4])
+            body.append(o_idx[1])
+            body.append(p_hash[11])
+
+            body.append(o_idx[2])
+            body.append(p_idx[0])
+
+            body.append(o_idx[3])
+            body.append(p_idx[1])
+
+            body.append(o_idx[4])
+            body.append(p_idx[2])
+
+            body.append(p_idx[3])
+            body.append(p_idx[4])
+
         # --- Main computation loop (fully unrolled, 16-group cross-pipeline) ---
         # 16-group hextet pipeline: A-P groups all interleaved.
         # 32 groups / 16 = 2 hextets, no remainder.
@@ -1444,9 +1991,96 @@ class KernelBuilder:
                         for s in slist:
                             body.append((e, s))
 
-                # Process 2 hextets with vselect
+                # Compute diff_r1_vec = node1 - node2 (for arithmetic select)
+                body.append(("valu", ("-", diff_r1_vec, nv_bcast1_r1, nv_bcast2_r1)))
+
+                # Process 2 hextets with arithmetic vselect (no flow engine)
                 for hextet_start in range(0, n_groups, 16):
-                    emit_hextet_vselect2(body, hextet_start, nv_bcast1_r1, nv_bcast2_r1)
+                    emit_hextet_vselect2(body, hextet_start, nv_bcast1_r1, nv_bcast2_r1, diff_r1_vec)
+
+            elif round_mod == 2:
+                # === Special: idx in {3,4,5,6}, load 4 nodes + arithmetic 2-level select ===
+                # Load nodes 3,4,5,6 from forest_values.
+                # Use add_imm to compute addresses forest_values_p+3..+6.
+                # Re-use nv_nodeX_r2 scratch as temp address holders.
+                setup_addr_slots = [
+                    ("flow", ("add_imm", nv_node3_r2, sc_forest_values_p, 3)),
+                    ("flow", ("add_imm", nv_node4_r2, sc_forest_values_p, 4)),
+                ]
+                setup_addr_slots2 = [
+                    ("flow", ("add_imm", nv_node5_r2, sc_forest_values_p, 5)),
+                    ("flow", ("add_imm", nv_node6_r2, sc_forest_values_p, 6)),
+                ]
+                for si in [setup_addr_slots, setup_addr_slots2]:
+                    si_instrs = self.build(si)
+                    for instr in si_instrs:
+                        for e, slist in instr.items():
+                            for s in slist:
+                                body.append((e, s))
+
+                # Load node values
+                load_slots = [
+                    ("load", ("load", nv_node3_r2, nv_node3_r2)),
+                    ("load", ("load", nv_node4_r2, nv_node4_r2)),
+                ]
+                load_slots2 = [
+                    ("load", ("load", nv_node5_r2, nv_node5_r2)),
+                    ("load", ("load", nv_node6_r2, nv_node6_r2)),
+                ]
+                for ls in [load_slots, load_slots2]:
+                    ls_instrs = self.build(ls)
+                    for instr in ls_instrs:
+                        for e, slist in instr.items():
+                            for s in slist:
+                                body.append((e, s))
+
+                # Broadcast node3 and node5
+                bcast_slots_r2a = [
+                    ("valu", ("vbroadcast", node3_bcast, nv_node3_r2)),
+                    ("valu", ("vbroadcast", node5_bcast, nv_node5_r2)),
+                ]
+                bcast_r2a_instrs = self.build(bcast_slots_r2a)
+                for instr in bcast_r2a_instrs:
+                    for e, slist in instr.items():
+                        for s in slist:
+                            body.append((e, s))
+
+                # Compute diff34 = node4 - node3, diff56 = node6 - node5 (valu)
+                # Also broadcast three_vec = three_scalar (needed for sub = idx - 3)
+                # nv_node4_r2 and nv_node6_r2 are scalars; diff34/diff56 are vectors.
+                # We need to broadcast node4 and node6 first to compute diffs as vectors.
+                # Simpler: broadcast all 4 nodes, then compute diffs.
+                # Actually: multiply_add(dest, bit0, diff34_bcast, node3_bcast) works with vectors.
+                # node4_bcast and node6_bcast are intermediate temps. We can reuse pair scratch.
+                # Use t1_tmp_pair[0] as node4_bcast_tmp and t2_tmp_pair[0] as node6_bcast_tmp.
+                # These will be overwritten in the hextet, but that's fine since we compute diffs first.
+                node4_bcast_tmp = t1_tmp_pair[0]
+                node6_bcast_tmp = t2_tmp_pair[0]
+                bcast_slots_r2b = [
+                    ("valu", ("vbroadcast", node4_bcast_tmp, nv_node4_r2)),
+                    ("valu", ("vbroadcast", node6_bcast_tmp, nv_node6_r2)),
+                    ("valu", ("vbroadcast", three_vec, three_scalar)),
+                ]
+                bcast_r2b_instrs = self.build(bcast_slots_r2b)
+                for instr in bcast_r2b_instrs:
+                    for e, slist in instr.items():
+                        for s in slist:
+                            body.append((e, s))
+
+                # Compute diffs (valu)
+                diff_slots = [
+                    ("valu", ("-", diff34_bcast, node4_bcast_tmp, node3_bcast)),
+                    ("valu", ("-", diff56_bcast, node6_bcast_tmp, node5_bcast)),
+                ]
+                diff_instrs = self.build(diff_slots)
+                for instr in diff_instrs:
+                    for e, slist in instr.items():
+                        for s in slist:
+                            body.append((e, s))
+
+                # Process 2 hextets with 4-node arithmetic select
+                for hextet_start in range(0, n_groups, 16):
+                    emit_hextet_arith4(body, hextet_start, node3_bcast, node5_bcast, diff34_bcast, diff56_bcast)
 
             else:
                 # === Normal: 16-group hextet pipeline with full loads ===
