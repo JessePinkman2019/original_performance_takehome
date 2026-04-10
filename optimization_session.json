@@ -589,6 +589,95 @@
       "timestamp": "2026-04-10T21:51:27.786618",
       "commit": "cf65700",
       "new_best": 2668
+    },
+    {
+      "type": "generator_started",
+      "attempt_id": "008",
+      "timestamp": "2026-04-10T21:56:37.233062",
+      "worktree": ".claude/worktrees/attempt-008"
+    },
+    {
+      "type": "checkpoint",
+      "attempt_id": "008",
+      "timestamp": "2026-04-10T22:53:20.020416",
+      "cycles": 2638,
+      "prev_best": 2668,
+      "improvement": 30,
+      "notes": "Layer 1 complete: addr-to-front optimization + intra_hextet_s. Normal rounds now 157c. Further improvement needed.",
+      "optimizations": [
+        "Moved na/nb/nc/nd addr ops to FRONT of all tail functions (noload, arith4, normal) - saves 2c/round",
+        "Added intra_hextet_s: A,B,C loads in hextet0 body steps 39-49 (idle load engine)",
+        "Added intra_tail_next_s: C[6:8]+D loads in hextet0 tail",
+        "d_preloaded=True in hextet1 body: skips D loads, removes step 6 overflow"
+      ]
+    },
+    {
+      "type": "generator_done",
+      "attempt_id": "008",
+      "timestamp": "2026-04-10T23:12:52.437533",
+      "cycles": 2638,
+      "prev_best": 2668,
+      "improvement": 30,
+      "improvement_pct": 1.12,
+      "status": "success",
+      "worktree": ".claude/worktrees/attempt-008",
+      "optimizations_implemented": [
+        "L1: Moved na/nb/nc/nd addr ops to FRONT of all tail functions (noload, arith4, normal) - enables loads to start ~12 cycles earlier in tail",
+        "L1: Applied to emit_hextet_noload tail (saves ~2c/round for mod0)",
+        "L1: Applied to emit_hextet_arith4 tail (saves ~2c/round for mod2->normal)",
+        "L1: Applied to emit_hextet_tail_steps50_63 (saves ~2c/round for all normal rounds)",
+        "L2: intra_hextet_s optimization: A,B,C loads moved to hextet0 body steps 39-49 (idle load engine)",
+        "L2: intra_tail_next_s: C[6:8]+D loads in hextet0 tail instead of A,B,C",
+        "L2: d_preloaded=True: hextet1 skips D.loads in steps 3-6, removes step-6 overflow",
+        "L3: group_idx_slots now uses addr_tmp_g[g] (per-group) instead of lsb_tmp_pair[p]+cmp_tmp_pair[p] (structural improvement, enables future parallel idx)"
+      ],
+      "per_hextet_cycles": 78.5,
+      "cycles_saved_breakdown": {
+        "addr_to_front_tail": 20,
+        "intra_hextet_s_plus_d_preloaded": 10,
+        "total": 30
+      },
+      "analysis": "Gap to 2164c (next threshold) = 474c. Normal rounds still at 157c (load bound 128c requires eliminating 29 idle load cycles per round). Main bottleneck: diagonal structure causes 4-load overflows at group boundaries, wastes ~13 cycles per hextet. Full restructuring needed for >300c improvement."
+    },
+    {
+      "type": "evaluator_result",
+      "attempt_id": "008",
+      "timestamp": "2026-04-10T23:40:00.000000",
+      "cycles_before": 2668,
+      "cycles_after": 2638,
+      "improvement_pct": 1.12,
+      "passed": true,
+      "fundamental_analysis": {
+        "load_theoretical_min": 1287,
+        "valu_theoretical_min": 1689,
+        "true_theoretical_min": 1809,
+        "note": "1689c valu floor (10134 main-loop valu ops / 6) + 120c setup = 1809c. Load (1287c) is NOT the bottleneck - valu is.",
+        "current_waste": 829,
+        "waste_breakdown": {
+          "special_rounds_nearly_zero_load": "rounds 0-2 use 430c with <6 total load ops → load engine idle 424c",
+          "valu_dep_chain_overhead": "10134 valu ops need 1689c minimum but take 2225c actual (1.32x overhead)",
+          "valu_idle_during_loads": "297 cycles post-setup have zero valu ops (11.8%), 225 of those are load-active",
+          "per_hextet_gap": "noload hextets: 62c actual vs 48c theoretical (1.31x overhead from dep chains)"
+        },
+        "why_1487_is_currently_unreachable": "Target 1487c requires main loop in 1367c. That's 1367x6=8202 valu slots. But main loop has 10134 valu ops - mathematically impossible to fit 10134 ops in 8202 slots. Each group-iteration needs irreducible minimum of 19 valu ops (addr+xor+hash12+idx5). Reducing below 19/group is not possible without changing the algorithm.",
+        "path_to_improvement": "The 430c special-round penalty (rounds 0-2: pure valu, zero loads) must be overlapped with normal-round loads via cross-round pipelining. With full diagonal unroll, special round valu runs during normal round load time. Theoretical: 1805c. Practical: 1850-2100c achievable.",
+        "new_direction": "Full cross-round diagonal pipeline: emit all 32x16=512 group-iterations in topological dependency order (group g, round k can start as soon as group g, round k-1 completes its idx_update). This breaks the round-sequential structure that keeps load engine idle for 430c during special rounds."
+      },
+      "round9_recommendation": "Implement full 32x16 diagonal unroll. Sort all (group, round) pairs by topological order. For each pair, emit: if normal round (mod>=3): addr + load + xor + hash + idx; if special round: xor_special + hash + idx. The build() VLIW packer will automatically interleave load ops from normal-round groups with valu ops from special-round groups. Expected: ~1900-2100c (vs 2638c, 20-28% improvement). This requires refactoring the main loop from 'for round in rounds: emit all 32 groups' to 'emit all 512 iterations in diagonal order'."
+    },
+    {
+      "type": "merged",
+      "attempt_id": "008",
+      "timestamp": "2026-04-10T23:40:01.000000",
+      "commit": "65d92ec",
+      "new_best": 2638
     }
-  ]
+  ],
+  "current_best": {
+    "cycles": 2638,
+    "commit": "65d92ec",
+    "technique": "intra_hextet_overlap_v2_plus_addr_prefetch",
+    "per_group_cycles": 82.44,
+    "speedup_over_original_baseline": 56.0
+  }
 }

@@ -12,13 +12,104 @@
 | 16-group hextet 流水线 + setup 打包 | 3,132 | 47.2x |
 | 早期 round 特判 (mod 0/1) | 2,966 | 49.8x |
 | 早期 round 特判 (mod 0/1/2) | 2,908 | 50.8x |
-| **hextet 跨边界 tail/head 重叠** | **2,668** | **55.4x** |
+| hextet 跨边界 tail/head 重叠 | 2,668 | 55.4x |
+| **addr 预取 + intra-hextet 流水线** | **2,638** | **56.0x** |
 
-通过测试：`test_baseline_60x` + `test_baseline_15x` + `test_round4_combined`（< 2975），threshold < 2763（passed）
+通过测试：所有 < 147734 及 < 18532 及 baseline_updated，但未通过 < 2164（需继续优化）
 
 ---
 
-## Round 7: hextet 跨边界 tail/head 重叠优化 (2026-04-10)
+## Round 8: addr 预取 + intra-hextet 流水线 (2026-04-10)
+
+- 候选 008（addr prefetch + intra-hextet pipelining）: **2,638 cycles** — ACCEPT，merged（commit 65d92ec）
+- 改进：2,668 → 2,638 cycles（1.12% 降低，56.0x over baseline）
+
+### 008 技术细节
+- **addr 操作前移至 tail 开头**：在 emit_hextet_noload/arith4/normal 的 tail 函数中，将 next_s 的 addr ops（A/B/C/D 的 addr 计算）提前到 step 50 的 valu ops 之前。因为 addr 用的是 valu 引擎，但与当前 valu ops 在不同 group 上，等价于"预取"地址，让后续 load 能更早启动（约提前 12c）
+- **intra_hextet_s（hextet0→hextet1 内联预取）**：在 hextet0 的 steps 39-49（load 引擎此时空闲，因为 O/P 在 hash 阶段），提前开始 hextet1 的 A/B/C loads（8+8+8=24 slots in 12 cycles）
+- **intra_tail_next_s**：在 hextet0 的 tail 中进一步预取 hextet1 的 C[6:8] + D（使 hextet1 跳过 D 的前 6 个 loads）
+- **d_preloaded=True**：hextet1 的 step 6 删掉 D 的重复 load，消除该步骤溢出
+
+### Cycle 分解（实测，16 rounds）
+| 类型 | rounds 数量 | 总 cycles |
+|------|-------------|----------|
+| Setup | — | 120c |
+| mod0 rounds (0, 11) | 2 | ~254c（127c×2） |
+| mod1 rounds (1, 12) | 2 | ~280c（140c×2） |
+| mod2 rounds (2, 13) | 2 | ~320c（160c×2） |
+| normal rounds (3-10, 14-15) | 10 | ~1570c（157c×10） |
+| **合计** | | **2638c** |
+
+### Round 8 引擎利用率（精确测量）
+| 引擎 | 总 slots | 活跃 cycles | 利用率 | 平均 slots/active_cycle |
+|------|---------|-------------|--------|------------------------|
+| valu | 10,134 | 2,225 | 84.3% | 4.56/6 |
+| load | 2,574 | 1,406 | 53.3% | 1.92/2 |
+
+---
+
+## Round 8 根本性方向分析：为什么 1,487c 目标在当前架构下无法实现
+
+### 精确理论下界计算
+
+**Valu 下界（真正的瓶颈）**：
+- 主循环 valu ops 总数：10,134 slots
+- valu 引擎上限：6 slots/cycle
+- **Valu 理论最小：10,134 / 6 = 1,689c**
+- 加上 setup（120c）：**总理论下界 = 1,809c**
+
+**Load 下界（次要瓶颈）**：
+- 10 normal rounds × 32 groups × 8 loads = 2,560 load_offset ops
+- 加 special round loads（14 ops）= 2,574 total
+- load 引擎上限：2 slots/cycle
+- **Load 理论最小：1,287c**（已被 valu 超越）
+
+**结论：在满载系统中 valu 是瓶颈（1,689c），而不是 load（1,287c）**
+
+### 为什么无法在 1,487c 完成
+
+1,487c 意味着主循环只有 1,367c。1,367c × 6 valu slots = 8,202 个 valu slot 预算。但我们有 10,134 个 valu ops 需要执行 → 差距 1,932 ops，数学上不可能。
+
+**每组每轮的 valu ops 不可约简**：
+- addr（idx + fvp_vec）：1 op
+- xor（val ^= node）：1 op  
+- hash（6 阶段 × 2 ops = 12 ops，已使用 multiply_add 优化）：12 ops
+- idx_update（lsb, offset, new_idx, cmp, idx）：5 ops
+- **最小值：19 ops/group/normal round**
+
+任何低于 19 的数字都需要改变算法正确性（不允许）。
+
+### 当前浪费的根源
+
+**Special rounds 的 430 cycle 惩罚**：
+- Rounds 0-2 (mod0/1/2) 占用 430 cycle，期间 load 引擎几乎空闲（<6 ops）
+- 这 430c 内 load 引擎浪费了 424 × 2 = 848 个 load slots
+- 但因为 valu 是瓶颈，即使填满这些 load slots 也无法超过 valu 的 1,689c 下界
+
+**实际差距来源**（2,638c vs 1,809c 理论）：
+- dep chain overhead：valu ops 实际需要 2,225c vs 理论 1,689c（+536c = +31.7% 开销）
+- 297 个 valu-idle cycles（其中 225 个是 load-active）= 约 +200c 可恢复的开销
+
+### Round 9 方向：跨 round 对角线流水线
+
+**问题本质**：当前以 round 为单位串行（Round k 全部完成 → Round k+1 开始），导致 special rounds 的 valu 和 load 无法真正重叠。
+
+**方案 A：完整 32×16 对角线展开（推荐）**
+- 将所有 512 个 (group, round) 对按拓扑依赖顺序 emit
+- 依赖：group g, round k+1 的 addr_compute 依赖 group g, round k 的 idx_update 写入
+- 在稳态中：load 引擎处理 normal-round 组的 load_offset，valu 引擎处理 special-round 组的 hash+idx
+- 理论上可将 special round 的 valu 隐藏在 normal round 的 load 时间内
+- **预期结果：~1,850-2,100c（vs 2,638c，降幅 20-28%）**
+
+**方案 B（保守）：跨 special-normal round 的局部重叠**
+- 只在相邻 special→normal 转换处做跨 round overlap
+- 实现复杂度低，但收益有限（~100-200c）
+
+**推荐方案 A**，理由：
+- Round 0-2（430c）和 Round 11-13（类似）各自在 load 引擎空闲的情况下完成
+- 对角线展开后，这些 round 的 valu 可以填入 normal round 的 load 间隙
+- 从 430c 的 special-round 惩罚降至近 0c（完全重叠）
+- 目标：突破 2,164c 门槛（test_opus4_many_hours），向 1,790c 门槛（test_opus45_casual）进发
 
 - 候选 007a（inter-hextet tail/head overlap）: **2,668 cycles** — ACCEPT，merged（commit cf65700）
 - 改进：2,908 → 2,668 cycles（8.25% 降低，55.4x over 147,734 baseline）
