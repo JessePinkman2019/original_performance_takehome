@@ -221,12 +221,22 @@ class KernelBuilder:
         for v in init_vars:
             self.alloc_scratch(v, 1)
 
-        # Load metadata: const + load pairs (cannot pack easily due to RAW)
+        # Load metadata: OPTIMIZED - emit all 7 consts first (packed 2/cycle),
+        # then all 7 loads (packed 2/cycle). Saves ~6 cycles vs 1-at-a-time.
+        # Two-pass: first allocate all addr_for_i scratch, then emit consts, then loads.
+        addr_for_init = []
         for i, v in enumerate(init_vars):
             addr_for_i = self.alloc_scratch()
             self.const_map[i] = addr_for_i
-            self.instrs.append({"load": [("const", addr_for_i, i)]})
-            self.instrs.append({"load": [("load", self.scratch[v], addr_for_i)]})
+            addr_for_init.append(addr_for_i)
+        # Emit all consts packed 2/cycle
+        for i in range(0, len(init_vars), 2):
+            slots = [("const", addr_for_init[j], j) for j in range(i, min(i+2, len(init_vars)))]
+            self.instrs.append({"load": slots})
+        # Emit all loads packed 2/cycle (no RAW conflicts since consts are already done)
+        for i in range(0, len(init_vars), 2):
+            slots = [("load", self.scratch[init_vars[j]], addr_for_init[j]) for j in range(i, min(i+2, len(init_vars)))]
+            self.instrs.append({"load": slots})
 
         # --- Allocate vector scratch regions ---
         # idx vectors: n_groups groups of VLEN words each
@@ -362,15 +372,22 @@ class KernelBuilder:
         addr_idx_g = [self.alloc_scratch(f"addr_idx_g_{g}") for g in range(n_groups)]
         addr_val_g = [self.alloc_scratch(f"addr_val_g_{g}") for g in range(n_groups)]
 
-        # Pre-compute group offset constants for address computation
+        # Pre-compute group offset constants for address computation.
+        # OPTIMIZED: allocate all new scratch first, then emit consts packed 2/cycle.
         group_offset_scalars = []
+        new_offset_entries = []  # (offset_val, scratch_addr) for new consts to emit
         for g in range(n_groups):
             offset_val = g * VLEN
             if offset_val not in self.const_map:
                 sc = self.alloc_scratch()
-                self.instrs.append({"load": [("const", sc, offset_val)]})
                 self.const_map[offset_val] = sc
+                new_offset_entries.append((offset_val, sc))
             group_offset_scalars.append(self.const_map[offset_val])
+        # Emit all new offset consts packed 2/cycle (load engine has 2 slots/cycle)
+        for i in range(0, len(new_offset_entries), 2):
+            pair = new_offset_entries[i:i+2]
+            slots = [("const", sc, val) for val, sc in pair]
+            self.instrs.append({"load": slots})
 
         # OPTIMIZED INIT: emit all idx alu ops first, then all val alu ops, then all vloads.
         # This eliminates WAW serialization from shared addr_scalar: each group now uses
@@ -512,12 +529,15 @@ class KernelBuilder:
         # --- No-load hextet: pure valu hextet for rounds with broadcast nv ---
         # Uses the same careful diagonal ordering as the normal hextet (just no addr/load).
         # This ensures pair-reuse safety (same as normal hextet).
-        def emit_hextet_noload(body, grp_start, nv_bcast, next_s=None):
+        def emit_hextet_noload(body, grp_start, nv_bcast, next_s=None, skip_xors=False, tail_inject_xors=None):
             """Emit 16-group no-load hextet using nv_bcast for xor.
             Uses the exact same diagonal ordering as normal hextet (steps 1-63),
             but skips all addr and load slots, replacing xor with bcast-xor.
             Pair safety is maintained by the same ordering constraints.
-            If next_s is provided, prefetch next round's hextet0 head in the tail."""
+            If next_s is provided, prefetch next round's hextet0 head in the tail.
+            If skip_xors=True, skip emitting the xor phase (already done externally).
+            If tail_inject_xors is provided (list of xor slots), inject them into
+            the free valu slots of tail steps 59-63 (which have 2-1 ops each)."""
             gA, gB, gC, gD = grp_start, grp_start+1, grp_start+2, grp_start+3
             gE, gF, gG, gH = grp_start+4, grp_start+5, grp_start+6, grp_start+7
             gI, gJ, gK, gL = grp_start+8, grp_start+9, grp_start+10, grp_start+11
@@ -594,37 +614,43 @@ class KernelBuilder:
             # Actually let build() handle packing naturally - just emit in the right order:
             # After A-K xors done: emit a_hash[0], then continue with remaining xors + hash diagonal.
 
-            # Cycle 1: A-F xors (6 ops, 1 cycle)
-            body.extend(a_xor)
-            body.extend(b_xor)
-            body.extend(c_xor)
-            body.extend(d_xor)
-            body.extend(e_xor)
-            body.extend(f_xor)
-            # Cycle 2: G-K xors + A.hash[0] (6 ops: packer will fit them together since
-            # A.hash[0] reads val_base+0*VLEN written in cycle 1 = a_xor → RAW forces new cycle,
-            # but G-K xors are independent → packer packs them with A.hash[0] in cycle 2)
-            body.extend(g_xor)
-            body.extend(h_xor)
-            body.extend(i_xor)
-            body.extend(j_xor)
-            body.extend(k_xor)
-            body.append(a_hash[0])
-            # Cycle 3: L-P xors + A.hash[1:3] + B.hash[0]
-            # L-P = 5 xors, a_hash[1], a_hash[2], b_hash[0] = 8 ops → 2 cycles
-            # Let build() pack: [L,M,N xor + a.hash[1], a.hash[2], b.hash[0]] = 6, [O,P xor] = 2
-            body.extend(l_xor)
-            body.extend(m_xor)
-            body.extend(n_xor)
-            body.append(a_hash[1])
-            body.append(a_hash[2])
-            body.append(b_hash[0])
-            # Remaining xors: O, P  (+ continuing hash diagonal)
-            body.extend(o_xor)
-            body.extend(p_xor)
-
-            # Continue hash+idx diagonal from where we left off (A.hash[3] onward)
-            # Step 6 equivalent: A.hash[3] + B.hash[1:3] + C.hash[0]
+            if not skip_xors:
+                # Cycle 1: A-F xors (6 ops, 1 cycle)
+                body.extend(a_xor)
+                body.extend(b_xor)
+                body.extend(c_xor)
+                body.extend(d_xor)
+                body.extend(e_xor)
+                body.extend(f_xor)
+                # Cycle 2: G-K xors + A.hash[0] (6 ops: packer will fit them together since
+                # A.hash[0] reads val_base+0*VLEN written in cycle 1 = a_xor → RAW forces new cycle,
+                # but G-K xors are independent → packer packs them with A.hash[0] in cycle 2)
+                body.extend(g_xor)
+                body.extend(h_xor)
+                body.extend(i_xor)
+                body.extend(j_xor)
+                body.extend(k_xor)
+                body.append(a_hash[0])
+                # Cycle 3: L-P xors + A.hash[1:3] + B.hash[0]
+                # L-P = 5 xors, a_hash[1], a_hash[2], b_hash[0] = 8 ops → 2 cycles
+                # Let build() pack: [L,M,N xor + a.hash[1], a.hash[2], b.hash[0]] = 6, [O,P xor] = 2
+                body.extend(l_xor)
+                body.extend(m_xor)
+                body.extend(n_xor)
+                body.append(a_hash[1])
+                body.append(a_hash[2])
+                body.append(b_hash[0])
+                # Remaining xors: O, P  (+ continuing hash diagonal)
+                body.extend(o_xor)
+                body.extend(p_xor)
+                # Continue hash+idx diagonal from where we left off (A.hash[3] onward)
+            else:
+                # Xors already applied externally (injected into previous hextet's tail).
+                # Start hash diagonal directly (no xors to emit).
+                body.append(a_hash[0])
+                body.append(a_hash[1])
+                body.append(a_hash[2])
+                body.append(b_hash[0])
             body.append(a_hash[3])
             body.append(b_hash[1])
             body.append(b_hash[2])
@@ -978,14 +1004,23 @@ class KernelBuilder:
             # Step 58: N.idx[4] + O.idx[1] + P.hash[11] [+ nb_loads[6:8]]
             body.append(n_idx[4]); body.append(o_idx[1]); body.append(p_hash[11])
             body.extend(nb_loads_nl[6:8])
-            # Step 59: O.idx[2] + P.idx[0] [+ nc_loads[0:2]]
+            # Steps 59-63: tail with free valu slots for xor injection.
+            # Each step has only 2 (or 1) valu ops, leaving 4 (or 5) free valu slots.
+            # tail_inject_xors (if provided) is a list of up to 16 single-tuple valu slots
+            # to inject here (16 groups x 1 xor each for next hextet).
+            ix = list(tail_inject_xors) if tail_inject_xors is not None else []
+            # Step 59: O.idx[2] + P.idx[0] [+ nc_loads[0:2]] [+ inject[0:4]]
             body.append(o_idx[2]); body.append(p_idx[0]); body.extend(nc_loads_nl[0:2])
-            # Step 60: O.idx[3] + P.idx[1] [+ nc_loads[2:4]]
+            body.extend(ix[0:4])
+            # Step 60: O.idx[3] + P.idx[1] [+ nc_loads[2:4]] [+ inject[4:8]]
             body.append(o_idx[3]); body.append(p_idx[1]); body.extend(nc_loads_nl[2:4])
-            # Step 61: O.idx[4] + P.idx[2] [+ nc_loads[4:6]]
+            body.extend(ix[4:8])
+            # Step 61: O.idx[4] + P.idx[2] [+ nc_loads[4:6]] [+ inject[8:12]]
             body.append(o_idx[4]); body.append(p_idx[2]); body.extend(nc_loads_nl[4:6])
-            # Step 62: P.idx[3] [+ nc_loads[6:8]]
+            body.extend(ix[8:12])
+            # Step 62: P.idx[3] [+ nc_loads[6:8]] [+ inject[12:16]]
             body.append(p_idx[3]); body.extend(nc_loads_nl[6:8])
+            body.extend(ix[12:16])
             # Step 63: P.idx[4] (nd_addr already emitted at front of tail)
             body.append(p_idx[4])
 
@@ -1935,9 +1970,13 @@ class KernelBuilder:
                 body_pre.extend([(e, s) for instr in setup_instrs for e, slots in instr.items() for s in slots])
                 body.extend(body_pre)
 
-                # Process 2 hextets (32 groups) with no loads
-                for hextet_start in range(0, n_groups, 16):
-                    emit_hextet_noload(body, hextet_start, nv_bcast_r0)
+                # Process 2 hextets (32 groups) with no loads.
+                # XOR INJECTION OPTIMIZATION: inject hextet1's 16 xors into hextet0's tail
+                # (free valu slots in steps 59-63), then skip xors in hextet1.
+                # This saves ~3 cycles per occurrence x 2 (rounds 0 and 11) = ~6 cycles total.
+                hex1_xors = [group_xor_bcast_slots(g, nv_bcast_r0)[0] for g in range(16, n_groups)]
+                emit_hextet_noload(body, 0, nv_bcast_r0, tail_inject_xors=hex1_xors)
+                emit_hextet_noload(body, 16, nv_bcast_r0, skip_xors=True)
 
             elif round_mod == 1:
                 # === Special: idx in {1,2}, load 2 nodes + vselect ===
