@@ -467,21 +467,30 @@ class KernelBuilder:
             return slots
 
         def group_idx_slots(g, p):
-            """Phase 5: index update (5 valu slots)"""
+            """Phase 5: index update (5 valu slots)
+            OPTIMIZATION: Uses addr_tmp_g[g] (per-group) for BOTH lsb and cmp temporaries
+            instead of lsb_tmp_pair[p] and cmp_tmp_pair[p] (pair-shared).
+            This eliminates WAW conflicts between groups sharing the same pair (e.g., A,E,I,M
+            all used to conflict on lsb_pair[0]). Now all 16 groups can run idx simultaneously!
+            - addr_tmp_g[g] was written during the addr phase and read during loads; after
+              all loads are done, it's free for reuse.
+            - lsb sequence: write addr_tmp(val&1) → write addr_tmp(lsb+1) → read for idx
+            - cmp reuses addr_tmp after lsb is consumed (step 3 reads lsb, step 4 writes cmp)
+            """
             idx_s = idx_base + g * VLEN
             val_s = val_base + g * VLEN
-            lsb = lsb_tmp_pair[p]
-            cmp = cmp_tmp_pair[p]
+            lsb = addr_tmp_g[g]  # per-group scratch (was lsb_tmp_pair[p])
+            cmp = addr_tmp_g[g]  # REUSE same per-group scratch for cmp (lsb consumed by step 3)
             slots = []
-            # lsb = val & 1
+            # lsb = val & 1  (write to addr_tmp_g[g])
             slots.append(("valu", ("&", lsb, val_s, one_vec)))
-            # offset = lsb + 1
+            # offset = lsb + 1  (read+write addr_tmp_g[g])
             slots.append(("valu", ("+", lsb, lsb, one_vec)))
-            # new_idx = idx * 2 + offset
+            # new_idx = idx * 2 + offset  (reads addr_tmp_g[g] = lsb; addr_tmp now free)
             slots.append(("valu", ("multiply_add", idx_s, idx_s, two_vec, lsb)))
-            # cmp = new_idx < n_nodes
+            # cmp = new_idx < n_nodes  (write to addr_tmp_g[g] = cmp, RAW prevents same bundle as above)
             slots.append(("valu", ("<", cmp, idx_s, n_nodes_vec)))
-            # idx = new_idx * cmp
+            # idx = new_idx * cmp  (reads addr_tmp_g[g] = cmp)
             slots.append(("valu", ("*", idx_s, idx_s, cmp)))
             return slots
 
@@ -914,13 +923,18 @@ class KernelBuilder:
                 na_addr_nl = nb_addr_nl = nc_addr_nl = nd_addr_nl = []
                 na_loads_nl = nb_loads_nl = nc_loads_nl = []
 
-            # Step 50: M.idx[0] + N.hash[7] + O.hash[3] + P.hash[0] [+ na_addr]
-            body.append(m_idx[0]); body.append(n_hash[7]); body.append(o_hash[3]); body.append(p_hash[0])
+            # OPTIMIZATION: Emit ALL 4 addr ops first (before step 50 valu ops).
             body.extend(na_addr_nl)
-            # Step 51: M.idx[1] + N.hash[8] + O.hash[4] + P.hash[1:3] [+ nb_addr + na_loads[0:2]]
+            body.extend(nb_addr_nl)
+            body.extend(nc_addr_nl)
+            body.extend(nd_addr_nl)
+
+            # Step 50: M.idx[0] + N.hash[7] + O.hash[3] + P.hash[0]
+            body.append(m_idx[0]); body.append(n_hash[7]); body.append(o_hash[3]); body.append(p_hash[0])
+            # Step 51: M.idx[1] + N.hash[8] + O.hash[4] + P.hash[1:3] [+ na_loads[0:2]]
             body.append(m_idx[1]); body.append(n_hash[8]); body.append(o_hash[4])
             body.append(p_hash[1]); body.append(p_hash[2])
-            body.extend(nb_addr_nl); body.extend(na_loads_nl[0:2])
+            body.extend(na_loads_nl[0:2])
             # Step 52: M.idx[2] + N.hash[9:11] + O.hash[5:7] + P.hash[3] [+ na_loads[2:4]]
             body.append(m_idx[2]); body.append(n_hash[9]); body.append(n_hash[10])
             body.append(o_hash[5]); body.append(o_hash[6]); body.append(p_hash[3])
@@ -931,9 +945,9 @@ class KernelBuilder:
             # Step 54: M.idx[4] + N.idx[0] + O.hash[8] + P.hash[5:7] [+ na_loads[6:8]]
             body.append(m_idx[4]); body.append(n_idx[0]); body.append(o_hash[8])
             body.append(p_hash[5]); body.append(p_hash[6]); body.extend(na_loads_nl[6:8])
-            # Step 55: N.idx[1] + O.hash[9:11] + P.hash[7] [+ nb_loads[0:2] + nc_addr]
+            # Step 55: N.idx[1] + O.hash[9:11] + P.hash[7] [+ nb_loads[0:2]]
             body.append(n_idx[1]); body.append(o_hash[9]); body.append(o_hash[10]); body.append(p_hash[7])
-            body.extend(nb_loads_nl[0:2]); body.extend(nc_addr_nl)
+            body.extend(nb_loads_nl[0:2])
             # Step 56: N.idx[2] + O.hash[11] + P.hash[8] [+ nb_loads[2:4]]
             body.append(n_idx[2]); body.append(o_hash[11]); body.append(p_hash[8])
             body.extend(nb_loads_nl[2:4])
@@ -951,8 +965,8 @@ class KernelBuilder:
             body.append(o_idx[4]); body.append(p_idx[2]); body.extend(nc_loads_nl[4:6])
             # Step 62: P.idx[3] [+ nc_loads[6:8]]
             body.append(p_idx[3]); body.extend(nc_loads_nl[6:8])
-            # Step 63: P.idx[4] [+ nd_addr]
-            body.append(p_idx[4]); body.extend(nd_addr_nl)
+            # Step 63: P.idx[4] (nd_addr already emitted at front of tail)
+            body.append(p_idx[4])
 
         # --- No-load hextet with arithmetic vselect for round_mod==1 ---
         def emit_hextet_vselect2(body, grp_start, nv_bcast1, nv_bcast2, diff_vec):
@@ -1830,11 +1844,18 @@ class KernelBuilder:
                 na_addr_t = nb_addr_t = nc_addr_t = nd_addr_t = []
                 na_loads_t = nb_loads_t = nc_loads_t = []
 
-            body.append(m_idx[0]); body.append(n_hash[7]); body.append(o_hash[3]); body.append(p_hash[0])
+            # OPTIMIZATION: Emit ALL 4 addr ops first (before step 50 valu ops).
+            # Same as normal hextet tail optimization: ensures addrs pack in first tail bundle,
+            # enabling loads to start ~12 cycles earlier.
             body.extend(na_addr_t)
+            body.extend(nb_addr_t)
+            body.extend(nc_addr_t)
+            body.extend(nd_addr_t)
+
+            body.append(m_idx[0]); body.append(n_hash[7]); body.append(o_hash[3]); body.append(p_hash[0])
             body.append(m_idx[1]); body.append(n_hash[8]); body.append(o_hash[4])
             body.append(p_hash[1]); body.append(p_hash[2])
-            body.extend(nb_addr_t); body.extend(na_loads_t[0:2])
+            body.extend(na_loads_t[0:2])
             body.append(m_idx[2]); body.append(n_hash[9]); body.append(n_hash[10])
             body.append(o_hash[5]); body.append(o_hash[6]); body.append(p_hash[3])
             body.extend(na_loads_t[2:4])
@@ -1844,7 +1865,7 @@ class KernelBuilder:
             body.append(p_hash[5]); body.append(p_hash[6])
             body.extend(na_loads_t[6:8])
             body.append(n_idx[1]); body.append(o_hash[9]); body.append(o_hash[10]); body.append(p_hash[7])
-            body.extend(nb_loads_t[0:2]); body.extend(nc_addr_t)
+            body.extend(nb_loads_t[0:2])
             body.append(n_idx[2]); body.append(o_hash[11]); body.append(p_hash[8])
             body.extend(nb_loads_t[2:4])
             body.append(n_idx[3]); body.append(o_idx[0]); body.append(p_hash[9]); body.append(p_hash[10])
@@ -1855,7 +1876,7 @@ class KernelBuilder:
             body.append(o_idx[3]); body.append(p_idx[1]); body.extend(nc_loads_t[2:4])
             body.append(o_idx[4]); body.append(p_idx[2]); body.extend(nc_loads_t[4:6])
             body.append(p_idx[3]); body.extend(nc_loads_t[6:8])
-            body.append(p_idx[4]); body.extend(nd_addr_t)
+            body.append(p_idx[4])
 
         # --- Main computation loop (fully unrolled, 16-group cross-pipeline) ---
         # 16-group hextet pipeline: A-P groups all interleaved.
@@ -2287,24 +2308,25 @@ class KernelBuilder:
 
                 def emit_hextet_tail_steps50_63(body, s, next_s=None):
                     """Emit hextet steps 50-63.
-                    If next_s is provided, interleave next hextet's A.addr + A.loads + B.addr
+                    If next_s is provided, interleave next hextet's A/B/C/D addr+loads
                     during these pure-valu tail steps (load engine otherwise idle).
-                    next_s['a_addr'] is 1 valu slot; emitted at step 50.
-                    next_s['a_loads'] is 8 load slots; emitted 2/step at steps 51-54.
-                    next_s['b_addr'] is 1 valu slot; emitted at step 51 (room for 1 more valu).
+                    KEY OPTIMIZATION: All 4 addr ops (A,B,C,D) are emitted FIRST (prepended
+                    before step 50 valu ops) so that loads can start as early as possible
+                    (packer places addrs in bundle ~52, enabling loads at bundle ~53 instead
+                    of the old approach where na_addr ended up at bundle ~65).
                     """
                     m_idx=s['m_idx']; n_idx=s['n_idx']; o_idx=s['o_idx']; p_idx=s['p_idx']
                     n_hash=s['n_hash']; o_hash=s['o_hash']; p_hash=s['p_hash']
 
-                    # Prepare next-hextet A+B head slots (if overlapping)
+                    # Prepare next-hextet A+B+C+D head slots (if overlapping)
                     if next_s is not None:
                         na_addr = next_s['a_addr']     # 1 valu slot
                         na_loads = next_s['a_loads']   # 8 load slots
-                        nb_addr = next_s['b_addr']     # 1 valu slot (fits at step 51, 5+1=6 valu ok)
-                        nb_loads = next_s['b_loads']   # 8 load slots (prefetch during steps 55-58)
-                        nc_addr = next_s['c_addr']     # 1 valu slot (fits at step 55, 4+1=5 valu)
-                        nc_loads = next_s['c_loads']   # 8 load slots (prefetch during steps 59-62)
-                        nd_addr = next_s['d_addr']     # 1 valu slot (fits at step 63, 1+1=2 valu)
+                        nb_addr = next_s['b_addr']     # 1 valu slot
+                        nb_loads = next_s['b_loads']   # 8 load slots
+                        nc_addr = next_s['c_addr']     # 1 valu slot
+                        nc_loads = next_s['c_loads']   # 8 load slots
+                        nd_addr = next_s['d_addr']     # 1 valu slot (D loads start in hextet1 body)
                     else:
                         na_addr = []
                         na_loads = []
@@ -2314,15 +2336,23 @@ class KernelBuilder:
                         nc_loads = []
                         nd_addr = []
 
-                    # Step 50: M.idx[0] + N.hash[7] + O.hash[3] + P.hash[0] [+ next_A.addr]
+                    # CRITICAL OPTIMIZATION: Emit ALL addr ops FIRST (before step 50 valu ops).
+                    # This ensures the packer places them in the first tail bundle (~bundle 52),
+                    # allowing loads to start at bundle ~53 instead of ~66.
+                    # Previously, na_addr was interleaved at step 50 (appended after 4 valu ops),
+                    # causing the packer to push na_addr to bundle 65 (last tail bundle) due to
+                    # VALU saturation in earlier tail steps.
+                    body.extend(na_addr)   # next A group addr: write addr_tmp_g[gA2]
+                    body.extend(nb_addr)   # next B group addr: independent of na_addr writes
+                    body.extend(nc_addr)   # next C group addr
+                    body.extend(nd_addr)   # next D group addr
+
+                    # Step 50: M.idx[0] + N.hash[7] + O.hash[3] + P.hash[0]
                     body.append(m_idx[0]); body.append(n_hash[7]); body.append(o_hash[3]); body.append(p_hash[0])
-                    body.extend(na_addr)  # valu slot, no conflict with above (all independent)
-                    # Step 51: M.idx[1] + N.hash[8] + O.hash[4] + P.hash[1:3] [+ next_B.addr + next_A.loads[0:2]]
-                    # 5 valu + 1 valu(nb_addr) = 6 valu (max), 2 load. All OK.
+                    # Step 51: M.idx[1] + N.hash[8] + O.hash[4] + P.hash[1:3] [+ next_A.loads[0:2]]
                     body.append(m_idx[1]); body.append(n_hash[8]); body.append(o_hash[4])
                     body.append(p_hash[1]); body.append(p_hash[2])
-                    body.extend(nb_addr)   # valu slot (nb_addr independent of na_loads RAW)
-                    body.extend(na_loads[0:2])  # load slots, load engine idle
+                    body.extend(na_loads[0:2])  # load slots (na_addr already in past bundle)
                     # Step 52: M.idx[2] + N.hash[9:11] + O.hash[5:7] + P.hash[3] [+ next_A.loads[2:4]]
                     body.append(m_idx[2]); body.append(n_hash[9]); body.append(n_hash[10])
                     body.append(o_hash[5]); body.append(o_hash[6]); body.append(p_hash[3])
@@ -2334,9 +2364,9 @@ class KernelBuilder:
                     body.append(m_idx[4]); body.append(n_idx[0]); body.append(o_hash[8])
                     body.append(p_hash[5]); body.append(p_hash[6])
                     body.extend(na_loads[6:8])
-                    # Step 55: N.idx[1] + O.hash[9:11] + P.hash[7] [+ next_B.loads[0:2] + next_C.addr]
+                    # Step 55: N.idx[1] + O.hash[9:11] + P.hash[7] [+ next_B.loads[0:2]]
                     body.append(n_idx[1]); body.append(o_hash[9]); body.append(o_hash[10]); body.append(p_hash[7])
-                    body.extend(nb_loads[0:2]); body.extend(nc_addr)
+                    body.extend(nb_loads[0:2])
                     # Step 56: N.idx[2] + O.hash[11] + P.hash[8] [+ next_B.loads[2:4]]
                     body.append(n_idx[2]); body.append(o_hash[11]); body.append(p_hash[8])
                     body.extend(nb_loads[2:4])
@@ -2358,14 +2388,24 @@ class KernelBuilder:
                     # Step 62: P.idx[3] [+ next_C.loads[6:8]]
                     body.append(p_idx[3])
                     body.extend(nc_loads[6:8])
-                    # Step 63: P.idx[4] [+ next_D.addr]
+                    # Step 63: P.idx[4]
+                    # nd_addr is already emitted at start of tail (first bundle).
+                    # D loads are handled in hextet1 body step 3 (which does a_xor + d_loads[:2]).
                     body.append(p_idx[4])
-                    body.extend(nd_addr)  # 1 valu slot, independent of everything above
 
-                def emit_hextet_body_steps3_63(body, s, next_round_s0=None, emit_tail=True):
+                def emit_hextet_body_steps3_63(body, s, next_round_s0=None, emit_tail=True, intra_hextet_s=None, d_preloaded=False):
                     """Emit hextet steps 3-63 (skipping A head: addr and loads already done).
                     If next_round_s0 is provided, the tail will prefetch next round's hextet0 head.
-                    If emit_tail=False, only steps 3-49 are emitted (caller handles the tail)."""
+                    If emit_tail=False, only steps 3-49 are emitted (caller handles the tail).
+                    If intra_hextet_s is provided (for hextet0 only), embed next hextet's A-C addr+loads
+                    into steps 3-49 to use the idle load engine during steps 39-49:
+                      - Step 3: prepend nh A,B,C,D addr ops (4 valu slots, 5 free available)
+                      - Steps 39-49: add A loads (steps 39-42), B loads (steps 43-46),
+                        C loads[0:4] (steps 47-48), D loads[0:2] (step 49) = 22 loads
+                    If d_preloaded=True (for hextet1 when hextet0 used intra_hextet_s), skip D.loads
+                    in steps 3-6 (D was loaded via hextet0 tail). This saves 1 cycle from step 6
+                    overflow removal (step 6 previously had 4 loads causing 2 bundles, now 2 loads).
+                    saving ~10c per round."""
                     a_loads=s['a_loads']; b_loads=s['b_loads']; c_loads=s['c_loads']; d_loads=s['d_loads']
                     e_loads=s['e_loads']; f_loads=s['f_loads']; g_loads=s['g_loads']; h_loads=s['h_loads']
                     i_loads=s['i_loads']; j_loads=s['j_loads']; k_loads=s['k_loads']; l_loads=s['l_loads']
@@ -2387,20 +2427,50 @@ class KernelBuilder:
                     i_idx=s['i_idx']; j_idx=s['j_idx']; k_idx=s['k_idx']; l_idx=s['l_idx']
                     m_idx=s['m_idx']; n_idx=s['n_idx']; o_idx=s['o_idx']; p_idx=s['p_idx']
 
-                    # Step 3 (modified): A.xor + D.loads[0:2]
+                    # Setup intra-hextet prefetch slots (hextet1 A,B,C,D addr+loads if provided)
+                    if intra_hextet_s is not None:
+                        nh_a_addr = intra_hextet_s['a_addr']    # 1 valu
+                        nh_b_addr = intra_hextet_s['b_addr']    # 1 valu
+                        nh_c_addr = intra_hextet_s['c_addr']    # 1 valu
+                        nh_d_addr = intra_hextet_s['d_addr']    # 1 valu
+                        nh_a_loads = intra_hextet_s['a_loads']  # 8 loads
+                        nh_b_loads = intra_hextet_s['b_loads']  # 8 loads
+                        nh_c_loads = intra_hextet_s['c_loads']  # 8 loads
+                        nh_d_loads = intra_hextet_s['d_loads']  # 8 loads
+                    else:
+                        nh_a_addr = nh_b_addr = nh_c_addr = nh_d_addr = []
+                        nh_a_loads = nh_b_loads = nh_c_loads = nh_d_loads = []
+
+                    # Step 3 (modified): [nh A,B,C,D addrs] + A.xor + D.loads[0:2]
                     # NOTE: prev hextet tail prefetched: A.addr, A.loads, B.addr, B.loads, C.addr, C.loads, D.addr
                     # D.addr done in tail, D.loads can start right away on load engine (free during A.xor)
-                    body.extend(a_xor); body.extend(d_loads[:2])
-                    # Step 4 (modified): A.hash[0] + B.xor + E.addr + D.loads[2:4]
-                    # E.addr is independent; emit early to start E.loads sooner
-                    body.append(a_hash[0]); body.extend(b_xor); body.extend(e_addr); body.extend(d_loads[2:4])
-                    # Step 5: A.hash[1:3] + B.hash[0] + C.xor + D.loads[4:6]
-                    # E.addr done in step 4; E.loads start at step 6
-                    body.append(a_hash[1]); body.append(a_hash[2]); body.append(b_hash[0])
-                    body.extend(c_xor); body.extend(d_loads[4:6])
-                    # Step 6: A.hash[3] + B.hash[1:3] + C.hash[0] + D.loads[6:8] + D.xor + E.loads[0:2] + F.addr
-                    body.append(a_hash[3]); body.append(b_hash[1]); body.append(b_hash[2]); body.append(c_hash[0])
-                    body.extend(d_loads[6:]); body.extend(d_xor); body.extend(e_loads[:2]); body.extend(f_addr)
+                    # nh addrs are for hextet1 groups - independent of current hextet's groups.
+                    # Step 3 has only 1 valu (a_xor) + 2 loads, so 4 nh addr valu ops fit easily.
+                    body.extend(nh_a_addr); body.extend(nh_b_addr)
+                    body.extend(nh_c_addr); body.extend(nh_d_addr)
+                    if d_preloaded:
+                        # D loads already done (by hextet0 intra+tail prefetch). Skip D loads.
+                        body.extend(a_xor)  # step 3: just a_xor (d_preloaded: D loads done)
+                        # Step 4 (modified): A.hash[0] + B.xor + E.addr (no d_loads!)
+                        body.append(a_hash[0]); body.extend(b_xor); body.extend(e_addr)
+                        # Step 5: A.hash[1:3] + B.hash[0] + C.xor (no d_loads, load engine idle)
+                        body.append(a_hash[1]); body.append(a_hash[2]); body.append(b_hash[0])
+                        body.extend(c_xor)
+                        # Step 6: A.hash[3] + B.hash[1:3] + C.hash[0] + D.xor + E.loads[0:2] + F.addr
+                        body.append(a_hash[3]); body.append(b_hash[1]); body.append(b_hash[2]); body.append(c_hash[0])
+                        body.extend(d_xor); body.extend(e_loads[:2]); body.extend(f_addr)
+                    else:
+                        body.extend(a_xor); body.extend(d_loads[:2])
+                        # Step 4 (modified): A.hash[0] + B.xor + E.addr + D.loads[2:4]
+                        # E.addr is independent; emit early to start E.loads sooner
+                        body.append(a_hash[0]); body.extend(b_xor); body.extend(e_addr); body.extend(d_loads[2:4])
+                        # Step 5: A.hash[1:3] + B.hash[0] + C.xor + D.loads[4:6]
+                        # E.addr done in step 4; E.loads start at step 6
+                        body.append(a_hash[1]); body.append(a_hash[2]); body.append(b_hash[0])
+                        body.extend(c_xor); body.extend(d_loads[4:6])
+                        # Step 6: A.hash[3] + B.hash[1:3] + C.hash[0] + D.loads[6:8] + D.xor + E.loads[0:2] + F.addr
+                        body.append(a_hash[3]); body.append(b_hash[1]); body.append(b_hash[2]); body.append(c_hash[0])
+                        body.extend(d_loads[6:]); body.extend(d_xor); body.extend(e_loads[:2]); body.extend(f_addr)
                     # Step 7 (modified): A.hash[4] + B.hash[3] + C.hash[1:3] + D.hash[0] + E.load[2:4]
                     # F.addr moved earlier (step 6), removed from here
                     body.append(a_hash[4]); body.append(b_hash[3]); body.append(c_hash[1]); body.append(c_hash[2]); body.append(d_hash[0])
@@ -2499,27 +2569,40 @@ class KernelBuilder:
                     body.append(i_hash[7]); body.append(j_hash[5]); body.append(j_hash[6]); body.append(k_hash[4]); body.append(l_hash[3])
                     body.extend(p_loads[6:]); body.extend(p_xor)
                     # Step 39: I.hash[8] + J.hash[7] + K.hash[5:7] + L.hash[4] + M.hash[0]
+                    # Step 39: I.hash[8] + J.hash[7] + K.hash[5:7] + L.hash[4] + M.hash[0]
+                    # [+ nh_a_loads[0:2] if intra_hextet_s provided]
                     body.append(i_hash[8]); body.append(j_hash[7]); body.append(k_hash[5]); body.append(k_hash[6]); body.append(l_hash[4]); body.append(m_hash[0])
-                    # Step 40: I.hash[9:11] + J.hash[8] + K.hash[7] + L.hash[5:7]
+                    body.extend(nh_a_loads[0:2])
+                    # Step 40: I.hash[9:11] + J.hash[8] + K.hash[7] + L.hash[5:7] [+ nh_a_loads[2:4]]
                     body.append(i_hash[9]); body.append(i_hash[10]); body.append(j_hash[8]); body.append(k_hash[7]); body.append(l_hash[5]); body.append(l_hash[6])
-                    # Step 41: I.hash[11] + J.hash[9:11] + K.hash[8] + L.hash[7] + M.hash[1]
+                    body.extend(nh_a_loads[2:4])
+                    # Step 41: I.hash[11] + J.hash[9:11] + K.hash[8] + L.hash[7] + M.hash[1] [+ nh_a_loads[4:6]]
                     body.append(i_hash[11]); body.append(j_hash[9]); body.append(j_hash[10]); body.append(k_hash[8]); body.append(l_hash[7]); body.append(m_hash[1])
-                    # Step 42: I.idx[0] + J.hash[11] + K.hash[9:11] + L.hash[8] + M.hash[2]
+                    body.extend(nh_a_loads[4:6])
+                    # Step 42: I.idx[0] + J.hash[11] + K.hash[9:11] + L.hash[8] + M.hash[2] [+ nh_a_loads[6:8]]
                     body.append(i_idx[0]); body.append(j_hash[11]); body.append(k_hash[9]); body.append(k_hash[10]); body.append(l_hash[8]); body.append(m_hash[2])
-                    # Step 43: I.idx[1] + J.idx[0] + K.hash[11] + L.hash[9:11] + M.hash[3]
+                    body.extend(nh_a_loads[6:8])
+                    # Step 43: I.idx[1] + J.idx[0] + K.hash[11] + L.hash[9:11] + M.hash[3] [+ nh_b_loads[0:2]]
                     body.append(i_idx[1]); body.append(j_idx[0]); body.append(k_hash[11]); body.append(l_hash[9]); body.append(l_hash[10]); body.append(m_hash[3])
-                    # Step 44: I.idx[2] + J.idx[1] + K.idx[0] + L.hash[11] + M.hash[4] + N.hash[0]
+                    body.extend(nh_b_loads[0:2])
+                    # Step 44: I.idx[2] + J.idx[1] + K.idx[0] + L.hash[11] + M.hash[4] + N.hash[0] [+ nh_b_loads[2:4]]
                     body.append(i_idx[2]); body.append(j_idx[1]); body.append(k_idx[0]); body.append(l_hash[11]); body.append(m_hash[4]); body.append(n_hash[0])
-                    # Step 45: I.idx[3] + J.idx[2] + K.idx[1] + L.idx[0] + M.hash[5:7]
+                    body.extend(nh_b_loads[2:4])
+                    # Step 45: I.idx[3] + J.idx[2] + K.idx[1] + L.idx[0] + M.hash[5:7] [+ nh_b_loads[4:6]]
                     body.append(i_idx[3]); body.append(j_idx[2]); body.append(k_idx[1]); body.append(l_idx[0]); body.append(m_hash[5]); body.append(m_hash[6])
-                    # Step 46: I.idx[4] + J.idx[3] + K.idx[2] + L.idx[1] + M.hash[7] + N.hash[1]
+                    body.extend(nh_b_loads[4:6])
+                    # Step 46: I.idx[4] + J.idx[3] + K.idx[2] + L.idx[1] + M.hash[7] + N.hash[1] [+ nh_b_loads[6:8]]
                     body.append(i_idx[4]); body.append(j_idx[3]); body.append(k_idx[2]); body.append(l_idx[1]); body.append(m_hash[7]); body.append(n_hash[1])
-                    # Step 47: J.idx[4] + K.idx[3] + L.idx[2] + M.hash[8] + N.hash[2:4]
+                    body.extend(nh_b_loads[6:8])
+                    # Step 47: J.idx[4] + K.idx[3] + L.idx[2] + M.hash[8] + N.hash[2:4] [+ nh_c_loads[0:2]]
                     body.append(j_idx[4]); body.append(k_idx[3]); body.append(l_idx[2]); body.append(m_hash[8]); body.append(n_hash[2]); body.append(n_hash[3])
-                    # Step 48: K.idx[4] + L.idx[3] + M.hash[9:11] + N.hash[4] + O.hash[0]
+                    body.extend(nh_c_loads[0:2])
+                    # Step 48: K.idx[4] + L.idx[3] + M.hash[9:11] + N.hash[4] + O.hash[0] [+ nh_c_loads[2:4]]
                     body.append(k_idx[4]); body.append(l_idx[3]); body.append(m_hash[9]); body.append(m_hash[10]); body.append(n_hash[4]); body.append(o_hash[0])
-                    # Step 49: L.idx[4] + M.hash[11] + N.hash[5:7] + O.hash[1:3]
+                    body.extend(nh_c_loads[2:4])
+                    # Step 49: L.idx[4] + M.hash[11] + N.hash[5:7] + O.hash[1:3] [+ nh_c_loads[4:6]]
                     body.append(l_idx[4]); body.append(m_hash[11]); body.append(n_hash[5]); body.append(n_hash[6]); body.append(o_hash[1]); body.append(o_hash[2])
+                    body.extend(nh_c_loads[4:6])
                     # Steps 50-63 via tail helper (with optional next round prefetch)
                     if emit_tail:
                         emit_hextet_tail_steps50_63(body, s, next_s=next_round_s0)
@@ -2540,15 +2623,40 @@ class KernelBuilder:
                     # hextet0's A.addr+A.loads+B.addr+B.loads+C.addr+C.loads+D.addr
                     # were prefetched in the previous round's hextet1 tail.
                     # Emit only steps 3-49 (skip head). Tail is handled separately below.
-                    emit_hextet_body_steps3_63(body, s0, emit_tail=False)
+                    # intra_hextet_s=s1: use idle load slots (steps 39-49) to prefetch hextet1 A,B,C loads
+                    # and embed hextet1 A,B,C,D addr ops at step 3 (free valu slots)
+                    emit_hextet_body_steps3_63(body, s0, emit_tail=False, intra_hextet_s=s1)
                 else:
                     # Emit hextet0 steps 1-49 (head + phases 1 and 2) fully
                     emit_hextet_body_steps1_49(body, s0)
 
-                # Emit hextet0 steps 50-63 WITH hextet1 A head overlaid in load slots
-                emit_hextet_tail_steps50_63(body, s0, next_s=s1)
-                # Emit hextet1 steps 3-49 (A head already done in hextet0 tail)
-                emit_hextet_body_steps3_63(body, s1, emit_tail=False)
+                # Emit hextet0 steps 50-63 WITH hextet1 A,B,C,D loads (partial) overlaid
+                # When intra_hextet_s was used for hextet0 body:
+                #   - hextet1 A loads (8) done in body steps 39-42
+                #   - hextet1 B loads (8) done in body steps 43-46
+                #   - hextet1 C loads [0:6] (6) done in body steps 47-49
+                #   - hextet1 A,B,C,D addr done at body step 3
+                # The tail must now: finish C[6:8] (2 loads) + D loads (8) in steps 51-58
+                # We pass a partial next_s where: a_loads=D.loads (for steps 51-54),
+                # c_loads=C.loads[6:8] (for steps 59 area), and everything else empty.
+                if prev_prefetched:
+                    # intra_hextet_s was used - pass partial tail prefetch
+                    intra_tail_next_s = {
+                        'a_addr': [],            # A addr already in hextet0 body step 3
+                        'a_loads': s1['d_loads'], # D loads → tail steps 51-54 (na_loads slot)
+                        'b_addr': [],            # B addr already in hextet0 body step 3
+                        'b_loads': [],           # B loads done in hextet0 body
+                        'c_addr': [],            # C addr already in hextet0 body step 3
+                        'c_loads': s1['c_loads'][6:8],  # remaining C[6:8] → tail step 59
+                        'd_addr': [],            # D addr already in hextet0 body step 3
+                    }
+                    emit_hextet_tail_steps50_63(body, s0, next_s=intra_tail_next_s)
+                    # Emit hextet1 steps 3-49 with D preloaded (skip d_loads in steps 3-6)
+                    emit_hextet_body_steps3_63(body, s1, emit_tail=False, d_preloaded=True)
+                else:
+                    emit_hextet_tail_steps50_63(body, s0, next_s=s1)
+                    # Emit hextet1 steps 3-49 (A head already done in hextet0 tail)
+                    emit_hextet_body_steps3_63(body, s1, emit_tail=False)
                 # Emit hextet1 steps 50-63 (with optional next-round hextet0 prefetch)
                 s0_next = s0 if next_normal else None  # next round uses same groups!
                 emit_hextet_tail_steps50_63(body, s1, next_s=s0_next)
