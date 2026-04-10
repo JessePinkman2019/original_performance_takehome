@@ -191,8 +191,9 @@ class KernelBuilder:
         """
         SIMD vectorized kernel using VLEN=8 vectors.
         Processes batch_size elements in groups of VLEN (8).
-        2-group cross-pipeline: interleaves A and B group slots so that
-        B's load phase overlaps with A's hash phase.
+        4-group cross-pipeline (quad pipeline): interleaves A, B, C, D group slots so that
+        A.hash + B.load + C.idx + D.addr all overlap simultaneously.
+        32 groups / 4 = 8 quads, no remainder. ~20 cycles/quad = 5 cycles/group.
         """
         assert batch_size % VLEN == 0, f"batch_size {batch_size} must be multiple of VLEN {VLEN}"
         n_groups = batch_size // VLEN  # 256 / 8 = 32
@@ -229,13 +230,16 @@ class KernelBuilder:
         addr_tmp_g = [self.alloc_scratch(f"addr_tmp_{g}", VLEN) for g in range(n_groups)]
         nv_tmp_g = [self.alloc_scratch(f"nv_tmp_{g}", VLEN) for g in range(n_groups)]
 
-        # Paired t1/t2/lsb/cmp temps: pair 0 used by group A (even index), pair 1 by group B (odd index)
-        # Since A and B are in different pipeline phases during the overlap, they don't conflict.
-        # 2 pairs × 4 × 8 = 64 words
-        t1_tmp_pair = [self.alloc_scratch(f"t1_tmp_{p}", VLEN) for p in range(2)]
-        t2_tmp_pair = [self.alloc_scratch(f"t2_tmp_{p}", VLEN) for p in range(2)]
-        lsb_tmp_pair = [self.alloc_scratch(f"lsb_tmp_{p}", VLEN) for p in range(2)]
-        cmp_tmp_pair = [self.alloc_scratch(f"cmp_tmp_{p}", VLEN) for p in range(2)]
+        # Paired t1/t2/lsb/cmp temps: 4 pairs for 4-group pipeline.
+        # pair 0 = group A (position 0 in quad)
+        # pair 1 = group B (position 1 in quad)
+        # pair 2 = group C (position 2 in quad)
+        # pair 3 = group D (position 3 in quad)
+        # 4 pairs × 4 × 8 = 128 words
+        t1_tmp_pair = [self.alloc_scratch(f"t1_tmp_{p}", VLEN) for p in range(4)]
+        t2_tmp_pair = [self.alloc_scratch(f"t2_tmp_{p}", VLEN) for p in range(4)]
+        lsb_tmp_pair = [self.alloc_scratch(f"lsb_tmp_{p}", VLEN) for p in range(4)]
+        cmp_tmp_pair = [self.alloc_scratch(f"cmp_tmp_{p}", VLEN) for p in range(4)]
 
         zero_vec = self.alloc_scratch("zero_vec", VLEN)
 
@@ -410,128 +414,176 @@ class KernelBuilder:
             slots.append(("valu", ("*", idx_s, idx_s, cmp)))
             return slots
 
-        # --- Main computation loop (fully unrolled, 2-group cross-pipeline) ---
+        # --- Main computation loop (fully unrolled, 4-group cross-pipeline) ---
+        # 4-group quad pipeline: A.hash + B.load + C.idx + D.addr overlap.
+        # 32 groups / 4 = 8 quads, no remainder.
+        # Interleave order from ROUND_PLAN_2b.json:
+        #   1. A.addr
+        #   2. A.load[:6] + B.addr + A.load[6:]
+        #   3. A.xor + B.load[:6] + C.addr + B.load[6:]
+        #   4. A.hash[0] + B.xor + C.load[:6] + D.addr + C.load[6:]
+        #   5. A.hash[1:3] + B.hash[0] + C.xor + D.load[:6]
+        #   6. A.hash[3] + B.hash[1:3] + C.hash[0] + D.xor + D.load[6:]
+        #   7-12. diagonal packing of hash slots
+        #   13-20. diagonal packing of idx slots
         body = []
 
         for rnd in range(rounds):
-            # Process groups in pairs of 2 (n_groups=32 is even)
-            for g in range(0, n_groups, 2):
-                gA = g
-                gB = g + 1
-                pA = 0  # pair 0 for group A
-                pB = 1  # pair 1 for group B
+            # Process groups in quads of 4 (n_groups=32 divides evenly by 4)
+            for g in range(0, n_groups, 4):
+                gA, gB, gC, gD = g, g+1, g+2, g+3
+                pA, pB, pC, pD = 0, 1, 2, 3
 
-                # --- Cross-pipeline schedule for pair (A, B): ---
-                # C1:  A.addr_compute
-                # C2:  A.load[0:2]
-                # C3:  A.load[2:4]
-                # C4:  A.load[4:6]
-                # C5:  A.load[6:8]  + B.addr_compute
-                # C6:  A.xor        + B.load[0:2]
-                # C7:  A.hash_s0_ma + B.load[2:4]
-                # C8:  A.hash_s1a   + B.load[4:6]
-                # C9:  A.hash_s1b   + B.load[6:8]
-                # C10: A.hash_s2_ma + B.xor
-                # C11: A.hash_s3a   + B.hash_s0_ma
-                # C12: A.hash_s3b   + B.hash_s1a
-                # C13: A.hash_s4_ma + B.hash_s1b
-                # C14: A.hash_s5a   + B.hash_s2_ma
-                # C15: A.hash_s5b   + B.hash_s3a
-                # C16: A.idx_lsb    + B.hash_s3b
-                # C17: A.idx_lsbp1  + B.hash_s4_ma
-                # C18: A.idx_ma     + B.hash_s5a
-                # C19: A.idx_cmp    + B.hash_s5b
-                # C20: A.idx_mul    + B.idx_lsb
-                # C21:               B.idx_lsbp1
-                # C22:               B.idx_ma
-                # C23:               B.idx_cmp
-                # C24:               B.idx_mul
-                #
-                # build() is greedy-forward: submitting slots in topological order
-                # lets it pack non-conflicting slots into the same bundle automatically.
+                # Pre-compute all phase slots
+                a_addr = group_addr_slots(gA)
+                b_addr = group_addr_slots(gB)
+                c_addr = group_addr_slots(gC)
+                d_addr = group_addr_slots(gD)
 
-                # Phase A addr
-                body.extend(group_addr_slots(gA))
-
-                # Phase A load (8 slots) + Phase B addr in the middle
                 a_loads = group_load_slots(gA)
-                # Submit first 6 A loads, then B addr, then last 2 A loads
-                # This encourages B.addr to pack with A's last load (C5)
+                b_loads = group_load_slots(gB)
+                c_loads = group_load_slots(gC)
+                d_loads = group_load_slots(gD)
+
+                a_xor = group_xor_slots(gA)
+                b_xor = group_xor_slots(gB)
+                c_xor = group_xor_slots(gC)
+                d_xor = group_xor_slots(gD)
+
+                a_hash = group_hash_slots(gA, pA)
+                b_hash = group_hash_slots(gB, pB)
+                c_hash = group_hash_slots(gC, pC)
+                d_hash = group_hash_slots(gD, pD)
+
+                a_idx = group_idx_slots(gA, pA)
+                b_idx = group_idx_slots(gB, pB)
+                c_idx = group_idx_slots(gC, pC)
+                d_idx = group_idx_slots(gD, pD)
+
+                # Step 1: A.addr
+                body.extend(a_addr)
+
+                # Step 2: A.load[:6] + B.addr + A.load[6:]
                 body.extend(a_loads[:6])
-                body.extend(group_addr_slots(gB))
+                body.extend(b_addr)
                 body.extend(a_loads[6:])
 
-                # Phase A xor + Phase B load (interleaved)
-                b_loads = group_load_slots(gB)
-                body.extend(group_xor_slots(gA))
-                body.extend(b_loads)
+                # Step 3: A.xor + B.load[:6] + C.addr + B.load[6:]
+                body.extend(a_xor)
+                body.extend(b_loads[:6])
+                body.extend(c_addr)
+                body.extend(b_loads[6:])
 
-                # Phase A hash (12 slots) interleaved with Phase B xor + hash
-                a_hash = group_hash_slots(gA, pA)
-                b_xor = group_xor_slots(gB)
-                b_hash = group_hash_slots(gB, pB)
+                # Step 4: A.hash[0] + B.xor + C.load[:6] + D.addr + C.load[6:]
+                body.append(a_hash[0])   # A: hash s0 (multiply_add)
+                body.extend(b_xor)       # B: xor
+                body.extend(c_loads[:6])
+                body.extend(d_addr)
+                body.extend(c_loads[6:])
 
-                # Interleave A hash with B xor then B hash
-                # A hash slots: indices 0..11
-                # B xor: 1 slot
-                # B hash: indices 0..11
-                # Strategy: submit A hash s0 (ma), then B xor,
-                # then interleave remaining A hash with B hash
-                body.append(a_hash[0])  # A: hash s0 (multiply_add)
-                body.extend(b_xor)      # B: xor (can pack with A next slot)
+                # Step 5: A.hash[1:3] + B.hash[0] + C.xor + D.load[:6]
+                body.append(a_hash[1])   # A: hash s1a
+                body.append(a_hash[2])   # A: hash s1b
+                body.append(b_hash[0])   # B: hash s0
+                body.extend(c_xor)       # C: xor
+                body.extend(d_loads[:6])
 
-                # A hash s1 pair (2 slots: t1=val^c, t2=val>>19) + B hash s0
-                body.append(a_hash[1])   # A: hash s1a (t1 = val ^ hash1_const)
-                body.append(a_hash[2])   # A: hash s1b (t2 = val >> 19)
-                body.append(b_hash[0])   # B: hash s0 (multiply_add)
+                # Step 6: A.hash[3] + B.hash[1:3] + C.hash[0] + D.load[6:] + D.xor
+                # NOTE: D.load[6:] MUST come before D.xor so the packer puts loads first
+                body.append(a_hash[3])   # A: hash s1 combine
+                body.append(b_hash[1])   # B: hash s1a
+                body.append(b_hash[2])   # B: hash s1b
+                body.append(c_hash[0])   # C: hash s0
+                body.extend(d_loads[6:])  # D: load lanes 6,7 (must precede xor)
+                body.extend(d_xor)       # D: xor (reads all nv_tmp_D after all 8 are loaded)
 
-                body.append(a_hash[3])   # A: hash s1 combine (val = t1 ^ t2)
-                body.append(b_hash[1])   # B: hash s1a (t1 = val ^ hash1_const)
-                body.append(b_hash[2])   # B: hash s1b (t2 = val >> 19)
-
-                body.append(a_hash[4])   # A: hash s2 (multiply_add)
+                # Step 7: A.hash[4] + B.hash[3] + C.hash[1:3] + D.hash[0]
+                body.append(a_hash[4])   # A: hash s2
                 body.append(b_hash[3])   # B: hash s1 combine
+                body.append(c_hash[1])   # C: hash s1a
+                body.append(c_hash[2])   # C: hash s1b
+                body.append(d_hash[0])   # D: hash s0
 
-                body.append(a_hash[5])   # A: hash s3a (t1 = val + hash3_const)
-                body.append(a_hash[6])   # A: hash s3b (t2 = val << 9)
-                body.append(b_hash[4])   # B: hash s2 (multiply_add)
+                # Step 8: A.hash[5:7] + B.hash[4] + C.hash[3] + D.hash[1:3]
+                body.append(a_hash[5])   # A: hash s3a
+                body.append(a_hash[6])   # A: hash s3b
+                body.append(b_hash[4])   # B: hash s2
+                body.append(c_hash[3])   # C: hash s1 combine
+                body.append(d_hash[1])   # D: hash s1a
+                body.append(d_hash[2])   # D: hash s1b
 
+                # Step 9: A.hash[7] + B.hash[5:7] + C.hash[4] + D.hash[3]
                 body.append(a_hash[7])   # A: hash s3 combine
                 body.append(b_hash[5])   # B: hash s3a
                 body.append(b_hash[6])   # B: hash s3b
+                body.append(c_hash[4])   # C: hash s2
+                body.append(d_hash[3])   # D: hash s1 combine
 
-                body.append(a_hash[8])   # A: hash s4 (multiply_add)
+                # Step 10: A.hash[8] + B.hash[7] + C.hash[5:7] + D.hash[4]
+                body.append(a_hash[8])   # A: hash s4
                 body.append(b_hash[7])   # B: hash s3 combine
+                body.append(c_hash[5])   # C: hash s3a
+                body.append(c_hash[6])   # C: hash s3b
+                body.append(d_hash[4])   # D: hash s2
 
-                body.append(a_hash[9])   # A: hash s5a (t1 = val ^ hash5_const)
-                body.append(a_hash[10])  # A: hash s5b (t2 = val >> 16)
-                body.append(b_hash[8])   # B: hash s4 (multiply_add)
+                # Step 11: A.hash[9:11] + B.hash[8] + C.hash[7] + D.hash[5:7]
+                body.append(a_hash[9])   # A: hash s5a
+                body.append(a_hash[10])  # A: hash s5b
+                body.append(b_hash[8])   # B: hash s4
+                body.append(c_hash[7])   # C: hash s3 combine
+                body.append(d_hash[5])   # D: hash s3a
+                body.append(d_hash[6])   # D: hash s3b
 
+                # Step 12: A.hash[11] + B.hash[9:11] + C.hash[8] + D.hash[7]
                 body.append(a_hash[11])  # A: hash s5 combine
-
                 body.append(b_hash[9])   # B: hash s5a
                 body.append(b_hash[10])  # B: hash s5b
+                body.append(c_hash[8])   # C: hash s4
+                body.append(d_hash[7])   # D: hash s3 combine
 
-                # Phase A idx (5 slots) interleaved with B hash s5 combine + B idx
-                a_idx = group_idx_slots(gA, pA)
-                b_idx = group_idx_slots(gB, pB)
-
+                # Step 13: A.idx[0] + B.hash[11] + C.hash[9:11] + D.hash[8]
                 body.append(a_idx[0])    # A: lsb = val & 1
                 body.append(b_hash[11])  # B: hash s5 combine
+                body.append(c_hash[9])   # C: hash s5a
+                body.append(c_hash[10])  # C: hash s5b
+                body.append(d_hash[8])   # D: hash s4
 
-                body.append(a_idx[1])    # A: offset = lsb + 1
+                # Step 14: A.idx[1] + B.idx[0] + C.hash[11] + D.hash[9:11]
+                body.append(a_idx[1])    # A: offset = lsb+1
                 body.append(b_idx[0])    # B: lsb = val & 1
+                body.append(c_hash[11])  # C: hash s5 combine
+                body.append(d_hash[9])   # D: hash s5a
+                body.append(d_hash[10])  # D: hash s5b
 
-                body.append(a_idx[2])    # A: new_idx = idx*2 + offset
-                body.append(b_idx[1])    # B: offset = lsb + 1
+                # Step 15: A.idx[2] + B.idx[1] + C.idx[0] + D.hash[11]
+                body.append(a_idx[2])    # A: new_idx = idx*2+offset
+                body.append(b_idx[1])    # B: offset = lsb+1
+                body.append(c_idx[0])    # C: lsb = val & 1
+                body.append(d_hash[11])  # D: hash s5 combine
 
+                # Step 16: A.idx[3] + B.idx[2] + C.idx[1] + D.idx[0]
                 body.append(a_idx[3])    # A: cmp = new_idx < n_nodes
-                body.append(b_idx[2])    # B: new_idx = idx*2 + offset
+                body.append(b_idx[2])    # B: new_idx = idx*2+offset
+                body.append(c_idx[1])    # C: offset = lsb+1
+                body.append(d_idx[0])    # D: lsb = val & 1
 
+                # Step 17: A.idx[4] + B.idx[3] + C.idx[2] + D.idx[1]
                 body.append(a_idx[4])    # A: idx = new_idx * cmp
                 body.append(b_idx[3])    # B: cmp = new_idx < n_nodes
+                body.append(c_idx[2])    # C: new_idx = idx*2+offset
+                body.append(d_idx[1])    # D: offset = lsb+1
 
+                # Step 18: B.idx[4] + C.idx[3] + D.idx[2]
                 body.append(b_idx[4])    # B: idx = new_idx * cmp
+                body.append(c_idx[3])    # C: cmp = new_idx < n_nodes
+                body.append(d_idx[2])    # D: new_idx = idx*2+offset
+
+                # Step 19: C.idx[4] + D.idx[3]
+                body.append(c_idx[4])    # C: idx = new_idx * cmp
+                body.append(d_idx[3])    # D: cmp = new_idx < n_nodes
+
+                # Step 20: D.idx[4]
+                body.append(d_idx[4])    # D: idx = new_idx * cmp
 
         # --- Store final idx and val vectors back to memory ---
         store_slots = []
