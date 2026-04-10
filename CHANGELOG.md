@@ -35,6 +35,20 @@
 
 ---
 
+## Round 2: 4-group 跨组流水线 (2026-04-10)
+
+- 候选 002a（3-group 流水线）: 5,056 cycles（改进 17.1%，通过 5791 阈值）
+- 候选 002b（4-group 流水线）: 4,176 cycles（改进 31.5%，35.4x over baseline）
+- 获胜者：002b，merged（commit c65462c）
+- 主要瓶颈：flow 引擎（每 cycle 只能 1 条分支指令）限制 loop 吞吐；散射 load 仍占主导；hash 依赖链尚未完全被 ILP 隐藏
+- 下一步建议：
+  1. 进一步展开到 6-group 或 8-group pipeline，让 valu 槽完全饱和（目前 valu 利用率 ~50%）
+  2. 将 scatter load 改为预计算地址 + 连续 vload，减少 load 引擎压力
+  3. hash 阶段 multiply_add 链的中间结果尝试乱序排列，掩盖 2-cycle 延迟
+  4. 目标下一轮 < 2164 cycles（test_opus4_many_hours 阈值）
+
+---
+
 ## 已完成优化：VLIW 贪心打包
 
 ### 做了什么
