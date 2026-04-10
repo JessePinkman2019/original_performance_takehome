@@ -191,9 +191,11 @@ class KernelBuilder:
         """
         SIMD vectorized kernel using VLEN=8 vectors.
         Processes batch_size elements in groups of VLEN (8).
-        4-group cross-pipeline (quad pipeline): interleaves A, B, C, D group slots so that
-        A.hash + B.load + C.idx + D.addr all overlap simultaneously.
-        32 groups / 4 = 8 quads, no remainder. ~20 cycles/quad = 5 cycles/group.
+        8-group cross-pipeline (octet pipeline): interleaves A-H group slots so that
+        A.hash + B.load + ... + H.idx all overlap simultaneously.
+        32 groups / 8 = 4 octets, no remainder. ~35 cycles/octet = ~4.4 cycles/group.
+        Pairs 0-3 are reused for E-H because A-D's pair temps are already consumed
+        (no WAW conflict) by the time E-H's hash/idx phases need them.
         """
         assert batch_size % VLEN == 0, f"batch_size {batch_size} must be multiple of VLEN {VLEN}"
         n_groups = batch_size // VLEN  # 256 / 8 = 32
@@ -230,12 +232,10 @@ class KernelBuilder:
         addr_tmp_g = [self.alloc_scratch(f"addr_tmp_{g}", VLEN) for g in range(n_groups)]
         nv_tmp_g = [self.alloc_scratch(f"nv_tmp_{g}", VLEN) for g in range(n_groups)]
 
-        # Paired t1/t2/lsb/cmp temps: 4 pairs for 4-group pipeline.
-        # pair 0 = group A (position 0 in quad)
-        # pair 1 = group B (position 1 in quad)
-        # pair 2 = group C (position 2 in quad)
-        # pair 3 = group D (position 3 in quad)
-        # 4 pairs × 4 × 8 = 128 words
+        # Paired t1/t2/lsb/cmp temps: 4 pairs (reused for both ABCD and EFGH).
+        # In the 8-group pipeline, by the time E uses pair 0 for hash,
+        # A has already finished reading pair 0 (A.idx is done). No WAW conflict.
+        # 4 pairs × 4 × 8 = 128 words (same as 4-group, no extra allocation needed)
         t1_tmp_pair = [self.alloc_scratch(f"t1_tmp_{p}", VLEN) for p in range(4)]
         t2_tmp_pair = [self.alloc_scratch(f"t2_tmp_{p}", VLEN) for p in range(4)]
         lsb_tmp_pair = [self.alloc_scratch(f"lsb_tmp_{p}", VLEN) for p in range(4)]
@@ -414,52 +414,71 @@ class KernelBuilder:
             slots.append(("valu", ("*", idx_s, idx_s, cmp)))
             return slots
 
-        # --- Main computation loop (fully unrolled, 4-group cross-pipeline) ---
-        # 4-group quad pipeline: A.hash + B.load + C.idx + D.addr overlap.
-        # 32 groups / 4 = 8 quads, no remainder.
-        # Interleave order from ROUND_PLAN_2b.json:
-        #   1. A.addr
-        #   2. A.load[:6] + B.addr + A.load[6:]
-        #   3. A.xor + B.load[:6] + C.addr + B.load[6:]
-        #   4. A.hash[0] + B.xor + C.load[:6] + D.addr + C.load[6:]
-        #   5. A.hash[1:3] + B.hash[0] + C.xor + D.load[:6]
-        #   6. A.hash[3] + B.hash[1:3] + C.hash[0] + D.xor + D.load[6:]
-        #   7-12. diagonal packing of hash slots
-        #   13-20. diagonal packing of idx slots
+        # --- Main computation loop (fully unrolled, 8-group cross-pipeline) ---
+        # 8-group octet pipeline: A-H groups all interleaved.
+        # 32 groups / 8 = 4 octets, no remainder.
+        # Pairs 0-3 are reused: E uses pair 0 (same as A), F uses pair 1, etc.
+        # This is safe because A/B/C/D's pair temps are consumed before E/F/G/H write to them.
+        # 35-step interleave schedule.
         body = []
 
         for rnd in range(rounds):
-            # Process groups in quads of 4 (n_groups=32 divides evenly by 4)
-            for g in range(0, n_groups, 4):
+            # Process groups in octets of 8 (n_groups=32 divides evenly by 8)
+            for g in range(0, n_groups, 8):
                 gA, gB, gC, gD = g, g+1, g+2, g+3
+                gE, gF, gG, gH = g+4, g+5, g+6, g+7
+                # E-H reuse pair indices 0-3 (safe: A-D done using these by the time E-H start)
                 pA, pB, pC, pD = 0, 1, 2, 3
+                pE, pF, pG, pH = 0, 1, 2, 3
 
-                # Pre-compute all phase slots
+                # Pre-compute all phase slots for all 8 groups
                 a_addr = group_addr_slots(gA)
                 b_addr = group_addr_slots(gB)
                 c_addr = group_addr_slots(gC)
                 d_addr = group_addr_slots(gD)
+                e_addr = group_addr_slots(gE)
+                f_addr = group_addr_slots(gF)
+                g_addr = group_addr_slots(gG)
+                h_addr = group_addr_slots(gH)
 
                 a_loads = group_load_slots(gA)
                 b_loads = group_load_slots(gB)
                 c_loads = group_load_slots(gC)
                 d_loads = group_load_slots(gD)
+                e_loads = group_load_slots(gE)
+                f_loads = group_load_slots(gF)
+                g_loads = group_load_slots(gG)
+                h_loads = group_load_slots(gH)
 
                 a_xor = group_xor_slots(gA)
                 b_xor = group_xor_slots(gB)
                 c_xor = group_xor_slots(gC)
                 d_xor = group_xor_slots(gD)
+                e_xor = group_xor_slots(gE)
+                f_xor = group_xor_slots(gF)
+                g_xor = group_xor_slots(gG)
+                h_xor = group_xor_slots(gH)
 
                 a_hash = group_hash_slots(gA, pA)
                 b_hash = group_hash_slots(gB, pB)
                 c_hash = group_hash_slots(gC, pC)
                 d_hash = group_hash_slots(gD, pD)
+                e_hash = group_hash_slots(gE, pE)
+                f_hash = group_hash_slots(gF, pF)
+                g_hash = group_hash_slots(gG, pG)
+                h_hash = group_hash_slots(gH, pH)
 
                 a_idx = group_idx_slots(gA, pA)
                 b_idx = group_idx_slots(gB, pB)
                 c_idx = group_idx_slots(gC, pC)
                 d_idx = group_idx_slots(gD, pD)
+                e_idx = group_idx_slots(gE, pE)
+                f_idx = group_idx_slots(gF, pF)
+                g_idx = group_idx_slots(gG, pG)
+                h_idx = group_idx_slots(gH, pH)
 
+                # ---- 35-step octet pipeline ----
+                # Steps 1-3: A/B/C addr+load startup (same as 4-group)
                 # Step 1: A.addr
                 body.extend(a_addr)
 
@@ -475,115 +494,241 @@ class KernelBuilder:
                 body.extend(b_loads[6:])
 
                 # Step 4: A.hash[0] + B.xor + C.load[:6] + D.addr + C.load[6:]
-                body.append(a_hash[0])   # A: hash s0 (multiply_add)
-                body.extend(b_xor)       # B: xor
+                body.append(a_hash[0])
+                body.extend(b_xor)
                 body.extend(c_loads[:6])
                 body.extend(d_addr)
                 body.extend(c_loads[6:])
 
-                # Step 5: A.hash[1:3] + B.hash[0] + C.xor + D.load[:6]
-                body.append(a_hash[1])   # A: hash s1a
-                body.append(a_hash[2])   # A: hash s1b
-                body.append(b_hash[0])   # B: hash s0
-                body.extend(c_xor)       # C: xor
+                # Step 5: A.hash[1:3] + B.hash[0] + C.xor + D.load[:6] + E.addr
+                body.append(a_hash[1])
+                body.append(a_hash[2])
+                body.append(b_hash[0])
+                body.extend(c_xor)
                 body.extend(d_loads[:6])
+                body.extend(e_addr)
 
-                # Step 6: A.hash[3] + B.hash[1:3] + C.hash[0] + D.load[6:] + D.xor
-                # NOTE: D.load[6:] MUST come before D.xor so the packer puts loads first
-                body.append(a_hash[3])   # A: hash s1 combine
-                body.append(b_hash[1])   # B: hash s1a
-                body.append(b_hash[2])   # B: hash s1b
-                body.append(c_hash[0])   # C: hash s0
-                body.extend(d_loads[6:])  # D: load lanes 6,7 (must precede xor)
-                body.extend(d_xor)       # D: xor (reads all nv_tmp_D after all 8 are loaded)
+                # Step 6: A.hash[3] + B.hash[1:3] + C.hash[0] + D.load[6:] + D.xor + E.load[:2]
+                # NOTE: D.load[6:] MUST come before D.xor (RAW dependency)
+                body.append(a_hash[3])
+                body.append(b_hash[1])
+                body.append(b_hash[2])
+                body.append(c_hash[0])
+                body.extend(d_loads[6:])   # D: load lanes 6,7 (must precede xor)
+                body.extend(d_xor)         # D: xor
+                body.extend(e_loads[:2])
 
-                # Step 7: A.hash[4] + B.hash[3] + C.hash[1:3] + D.hash[0]
-                body.append(a_hash[4])   # A: hash s2
-                body.append(b_hash[3])   # B: hash s1 combine
-                body.append(c_hash[1])   # C: hash s1a
-                body.append(c_hash[2])   # C: hash s1b
-                body.append(d_hash[0])   # D: hash s0
+                # Step 7: A.hash[4] + B.hash[3] + C.hash[1:3] + D.hash[0] + E.load[2:4] + F.addr
+                body.append(a_hash[4])
+                body.append(b_hash[3])
+                body.append(c_hash[1])
+                body.append(c_hash[2])
+                body.append(d_hash[0])
+                body.extend(e_loads[2:4])
+                body.extend(f_addr)
 
-                # Step 8: A.hash[5:7] + B.hash[4] + C.hash[3] + D.hash[1:3]
-                body.append(a_hash[5])   # A: hash s3a
-                body.append(a_hash[6])   # A: hash s3b
-                body.append(b_hash[4])   # B: hash s2
-                body.append(c_hash[3])   # C: hash s1 combine
-                body.append(d_hash[1])   # D: hash s1a
-                body.append(d_hash[2])   # D: hash s1b
+                # Step 8: A.hash[5:7] + B.hash[4] + C.hash[3] + D.hash[1:3] + E.load[4:6]
+                body.append(a_hash[5])
+                body.append(a_hash[6])
+                body.append(b_hash[4])
+                body.append(c_hash[3])
+                body.append(d_hash[1])
+                body.append(d_hash[2])
+                body.extend(e_loads[4:6])
 
-                # Step 9: A.hash[7] + B.hash[5:7] + C.hash[4] + D.hash[3]
-                body.append(a_hash[7])   # A: hash s3 combine
-                body.append(b_hash[5])   # B: hash s3a
-                body.append(b_hash[6])   # B: hash s3b
-                body.append(c_hash[4])   # C: hash s2
-                body.append(d_hash[3])   # D: hash s1 combine
+                # Step 9: A.hash[7] + B.hash[5:7] + C.hash[4] + D.hash[3] + E.load[6:] + E.xor + F.load[:2]
+                # NOTE: E.load[6:] MUST come before E.xor
+                body.append(a_hash[7])
+                body.append(b_hash[5])
+                body.append(b_hash[6])
+                body.append(c_hash[4])
+                body.append(d_hash[3])
+                body.extend(e_loads[6:])   # E: load lanes 6,7
+                body.extend(e_xor)         # E: xor
+                body.extend(f_loads[:2])
 
-                # Step 10: A.hash[8] + B.hash[7] + C.hash[5:7] + D.hash[4]
-                body.append(a_hash[8])   # A: hash s4
-                body.append(b_hash[7])   # B: hash s3 combine
-                body.append(c_hash[5])   # C: hash s3a
-                body.append(c_hash[6])   # C: hash s3b
-                body.append(d_hash[4])   # D: hash s2
+                # Step 10: A.hash[8] + B.hash[7] + C.hash[5:7] + D.hash[4] + F.load[2:4] + G.addr
+                body.append(a_hash[8])
+                body.append(b_hash[7])
+                body.append(c_hash[5])
+                body.append(c_hash[6])
+                body.append(d_hash[4])
+                body.extend(f_loads[2:4])
+                body.extend(g_addr)
 
-                # Step 11: A.hash[9:11] + B.hash[8] + C.hash[7] + D.hash[5:7]
-                body.append(a_hash[9])   # A: hash s5a
-                body.append(a_hash[10])  # A: hash s5b
-                body.append(b_hash[8])   # B: hash s4
-                body.append(c_hash[7])   # C: hash s3 combine
-                body.append(d_hash[5])   # D: hash s3a
-                body.append(d_hash[6])   # D: hash s3b
+                # Step 11: A.hash[9:11] + B.hash[8] + C.hash[7] + D.hash[5:7] + F.load[4:6]
+                body.append(a_hash[9])
+                body.append(a_hash[10])
+                body.append(b_hash[8])
+                body.append(c_hash[7])
+                body.append(d_hash[5])
+                body.append(d_hash[6])
+                body.extend(f_loads[4:6])
 
-                # Step 12: A.hash[11] + B.hash[9:11] + C.hash[8] + D.hash[7]
-                body.append(a_hash[11])  # A: hash s5 combine
-                body.append(b_hash[9])   # B: hash s5a
-                body.append(b_hash[10])  # B: hash s5b
-                body.append(c_hash[8])   # C: hash s4
-                body.append(d_hash[7])   # D: hash s3 combine
+                # Step 12: A.hash[11] + B.hash[9:11] + C.hash[8] + D.hash[7] + F.load[6:] + F.xor + G.load[:2]
+                # NOTE: F.load[6:] MUST come before F.xor
+                body.append(a_hash[11])
+                body.append(b_hash[9])
+                body.append(b_hash[10])
+                body.append(c_hash[8])
+                body.append(d_hash[7])
+                body.extend(f_loads[6:])   # F: load lanes 6,7
+                body.extend(f_xor)         # F: xor
+                body.extend(g_loads[:2])
 
-                # Step 13: A.idx[0] + B.hash[11] + C.hash[9:11] + D.hash[8]
-                body.append(a_idx[0])    # A: lsb = val & 1
-                body.append(b_hash[11])  # B: hash s5 combine
-                body.append(c_hash[9])   # C: hash s5a
-                body.append(c_hash[10])  # C: hash s5b
-                body.append(d_hash[8])   # D: hash s4
+                # Step 13: A.idx[0] + B.hash[11] + C.hash[9:11] + D.hash[8] + G.load[2:4] + H.addr
+                body.append(a_idx[0])
+                body.append(b_hash[11])
+                body.append(c_hash[9])
+                body.append(c_hash[10])
+                body.append(d_hash[8])
+                body.extend(g_loads[2:4])
+                body.extend(h_addr)
 
-                # Step 14: A.idx[1] + B.idx[0] + C.hash[11] + D.hash[9:11]
-                body.append(a_idx[1])    # A: offset = lsb+1
-                body.append(b_idx[0])    # B: lsb = val & 1
-                body.append(c_hash[11])  # C: hash s5 combine
-                body.append(d_hash[9])   # D: hash s5a
-                body.append(d_hash[10])  # D: hash s5b
+                # Step 14: A.idx[1] + B.idx[0] + C.hash[11] + D.hash[9:11] + G.load[4:6]
+                body.append(a_idx[1])
+                body.append(b_idx[0])
+                body.append(c_hash[11])
+                body.append(d_hash[9])
+                body.append(d_hash[10])
+                body.extend(g_loads[4:6])
 
-                # Step 15: A.idx[2] + B.idx[1] + C.idx[0] + D.hash[11]
-                body.append(a_idx[2])    # A: new_idx = idx*2+offset
-                body.append(b_idx[1])    # B: offset = lsb+1
-                body.append(c_idx[0])    # C: lsb = val & 1
-                body.append(d_hash[11])  # D: hash s5 combine
+                # Step 15: A.idx[2] + B.idx[1] + C.idx[0] + D.hash[11] + G.load[6:] + G.xor + H.load[:2]
+                # NOTE: G.load[6:] MUST come before G.xor
+                body.append(a_idx[2])
+                body.append(b_idx[1])
+                body.append(c_idx[0])
+                body.append(d_hash[11])
+                body.extend(g_loads[6:])   # G: load lanes 6,7
+                body.extend(g_xor)         # G: xor
+                body.extend(h_loads[:2])
 
-                # Step 16: A.idx[3] + B.idx[2] + C.idx[1] + D.idx[0]
-                body.append(a_idx[3])    # A: cmp = new_idx < n_nodes
-                body.append(b_idx[2])    # B: new_idx = idx*2+offset
-                body.append(c_idx[1])    # C: offset = lsb+1
-                body.append(d_idx[0])    # D: lsb = val & 1
+                # Step 16: A.idx[3] + B.idx[2] + C.idx[1] + D.idx[0] + H.load[2:4]
+                body.append(a_idx[3])
+                body.append(b_idx[2])
+                body.append(c_idx[1])
+                body.append(d_idx[0])
+                body.extend(h_loads[2:4])
 
-                # Step 17: A.idx[4] + B.idx[3] + C.idx[2] + D.idx[1]
-                body.append(a_idx[4])    # A: idx = new_idx * cmp
-                body.append(b_idx[3])    # B: cmp = new_idx < n_nodes
-                body.append(c_idx[2])    # C: new_idx = idx*2+offset
-                body.append(d_idx[1])    # D: offset = lsb+1
+                # Step 17: A.idx[4] + B.idx[3] + C.idx[2] + D.idx[1] + H.load[4:6]
+                body.append(a_idx[4])
+                body.append(b_idx[3])
+                body.append(c_idx[2])
+                body.append(d_idx[1])
+                body.extend(h_loads[4:6])
 
-                # Step 18: B.idx[4] + C.idx[3] + D.idx[2]
-                body.append(b_idx[4])    # B: idx = new_idx * cmp
-                body.append(c_idx[3])    # C: cmp = new_idx < n_nodes
-                body.append(d_idx[2])    # D: new_idx = idx*2+offset
+                # Step 18: B.idx[4] + C.idx[3] + D.idx[2] + H.load[6:] + H.xor
+                # NOTE: H.load[6:] MUST come before H.xor
+                body.append(b_idx[4])
+                body.append(c_idx[3])
+                body.append(d_idx[2])
+                body.extend(h_loads[6:])   # H: load lanes 6,7
+                body.extend(h_xor)         # H: xor
 
-                # Step 19: C.idx[4] + D.idx[3]
-                body.append(c_idx[4])    # C: idx = new_idx * cmp
-                body.append(d_idx[3])    # D: cmp = new_idx < n_nodes
+                # Step 19: C.idx[4] + D.idx[3] + E.hash[0]
+                body.append(c_idx[4])
+                body.append(d_idx[3])
+                body.append(e_hash[0])
 
-                # Step 20: D.idx[4]
-                body.append(d_idx[4])    # D: idx = new_idx * cmp
+                # Step 20: D.idx[4] + E.hash[1:3] + F.hash[0]
+                body.append(d_idx[4])
+                body.append(e_hash[1])
+                body.append(e_hash[2])
+                body.append(f_hash[0])
+
+                # Step 21: E.hash[3] + F.hash[1:3] + G.hash[0]
+                body.append(e_hash[3])
+                body.append(f_hash[1])
+                body.append(f_hash[2])
+                body.append(g_hash[0])
+
+                # Step 22: E.hash[4] + F.hash[3] + G.hash[1:3] + H.hash[0]
+                body.append(e_hash[4])
+                body.append(f_hash[3])
+                body.append(g_hash[1])
+                body.append(g_hash[2])
+                body.append(h_hash[0])
+
+                # Step 23: E.hash[5:7] + F.hash[4] + G.hash[3] + H.hash[1:3]
+                body.append(e_hash[5])
+                body.append(e_hash[6])
+                body.append(f_hash[4])
+                body.append(g_hash[3])
+                body.append(h_hash[1])
+                body.append(h_hash[2])
+
+                # Step 24: E.hash[7] + F.hash[5:7] + G.hash[4] + H.hash[3]
+                body.append(e_hash[7])
+                body.append(f_hash[5])
+                body.append(f_hash[6])
+                body.append(g_hash[4])
+                body.append(h_hash[3])
+
+                # Step 25: E.hash[8] + F.hash[7] + G.hash[5:7] + H.hash[4]
+                body.append(e_hash[8])
+                body.append(f_hash[7])
+                body.append(g_hash[5])
+                body.append(g_hash[6])
+                body.append(h_hash[4])
+
+                # Step 26: E.hash[9:11] + F.hash[8] + G.hash[7] + H.hash[5:7]
+                body.append(e_hash[9])
+                body.append(e_hash[10])
+                body.append(f_hash[8])
+                body.append(g_hash[7])
+                body.append(h_hash[5])
+                body.append(h_hash[6])
+
+                # Step 27: E.hash[11] + F.hash[9:11] + G.hash[8] + H.hash[7]
+                body.append(e_hash[11])
+                body.append(f_hash[9])
+                body.append(f_hash[10])
+                body.append(g_hash[8])
+                body.append(h_hash[7])
+
+                # Step 28: E.idx[0] + F.hash[11] + G.hash[9:11] + H.hash[8]
+                body.append(e_idx[0])
+                body.append(f_hash[11])
+                body.append(g_hash[9])
+                body.append(g_hash[10])
+                body.append(h_hash[8])
+
+                # Step 29: E.idx[1] + F.idx[0] + G.hash[11] + H.hash[9:11]
+                body.append(e_idx[1])
+                body.append(f_idx[0])
+                body.append(g_hash[11])
+                body.append(h_hash[9])
+                body.append(h_hash[10])
+
+                # Step 30: E.idx[2] + F.idx[1] + G.idx[0] + H.hash[11]
+                body.append(e_idx[2])
+                body.append(f_idx[1])
+                body.append(g_idx[0])
+                body.append(h_hash[11])
+
+                # Step 31: E.idx[3] + F.idx[2] + G.idx[1] + H.idx[0]
+                body.append(e_idx[3])
+                body.append(f_idx[2])
+                body.append(g_idx[1])
+                body.append(h_idx[0])
+
+                # Step 32: E.idx[4] + F.idx[3] + G.idx[2] + H.idx[1]
+                body.append(e_idx[4])
+                body.append(f_idx[3])
+                body.append(g_idx[2])
+                body.append(h_idx[1])
+
+                # Step 33: F.idx[4] + G.idx[3] + H.idx[2]
+                body.append(f_idx[4])
+                body.append(g_idx[3])
+                body.append(h_idx[2])
+
+                # Step 34: G.idx[4] + H.idx[3]
+                body.append(g_idx[4])
+                body.append(h_idx[3])
+
+                # Step 35: H.idx[4]
+                body.append(h_idx[4])
 
         # --- Store final idx and val vectors back to memory ---
         store_slots = []
