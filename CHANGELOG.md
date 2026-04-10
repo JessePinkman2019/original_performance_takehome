@@ -9,9 +9,117 @@
 | SIMD 向量化 + multiply_add | 9,936 | 14.87x |
 | 4-group 流水线 | 4,176 | 35.4x |
 | 8-group octet 流水线 | 3,344 | 44.2x |
-| **16-group hextet 流水线 + setup 打包** | **3,132** | **47.2x** |
+| 16-group hextet 流水线 + setup 打包 | 3,132 | 47.2x |
+| 早期 round 特判 (mod 0/1) | 2,966 | 49.8x |
+| **早期 round 特判 (mod 0/1/2)** | **2,908** | **50.8x** |
 
-通过测试：`test_kernel_speedup` + `test_kernel_updated_starting_point` + `test_kernel_correctness` + `test_round4_sonnet`（尚待确认阈值名称）
+通过测试：`test_baseline_60x` + `test_baseline_15x` + `test_round4_combined`（< 2975）
+
+---
+
+## Round 6: 早期 round 特判 mod 0/1/2 (2026-04-10)
+
+- 候选 006（mod2 special-casing + valu arith-select）: **2,908 cycles** — ACCEPT（small improvement），merged（commit a876a68）
+- 改进：2,966 → 2,908 cycles（1.96% 降低，50.8x over baseline）
+- 标记 `small_improvement`：改进 <5%，但方向正确，接受
+
+### 006 技术细节
+- **round_mod==2（rounds 2, 13）**：idx ∈ {3,4,5,6}（4 个节点），用 2 级算术 select 替代 8×load_offset：
+  - `bit0 = idx & 1`：区分奇偶（低位对）
+  - `bit1 = (idx - 3) >> 1`：区分高低对
+  - `nv = node3 + bit0*(node4-node3)`：选 {3,4} 之一
+  - `nv_hi = node5 + bit0*(node6-node5)`：选 {5,6} 之一
+  - `nv = nv_lo + bit1*(nv_hi-nv_lo)`：最终选择
+  - 8 valu ops/group vs 8 load_offset/group，节省 174 cycles（2 mod2 rounds）
+- **round_mod==1 优化**：用 `multiply_add` 替代 `flow vselect`，消除 16c/hextet 串行化
+  - `nv = node2 + lsb*(node1-node2) = multiply_add(lsb, diff, node2_bcast)`
+  - 纯 valu，无 flow 引擎，可并行打包
+
+### Cycle 分解（精确测量）
+| 类型 | rounds 数量 | 总 cycles |
+|------|-------------|----------|
+| Setup（固定） | — | 188c |
+| mod0 rounds | 2（round 0, 11）| 254c（127c×2） |
+| mod1 rounds | 2（round 1, 12）| 280c（140c×2） |
+| mod2 rounds | 2（round 2, 13）| 348c（174c×2） |
+| normal rounds | 10（mod 3-10, 14-15）| 1840c（184c×10） |
+| **合计** | | **2910c（测量 2908c）** |
+
+### Round 7 瓶颈分析
+
+Normal rounds 贡献 1840/2908 = **63.3%** 的 cycles，是最大目标。
+
+| 指标 | 数值 |
+|------|------|
+| Normal hextet 实际 | 92 cycles |
+| 理论最小（load bound） | 64 cycles（128 load_offset / 2 slots） |
+| 当前 overhead | 28 cycles/hextet（43.8% 浪费） |
+| 到达 1487 所需的 normal round 预算 | 42 cycles/round（不可能，低于 load 下限） |
+
+关键约束：`1487` 目标要求每 normal round 仅 42 cycles，而 load 引擎物理最低 128 cycles/round（64×2 hextets）。**在不改变 load 架构的情况下，1487 无法仅靠 normal 轮优化达到。**
+
+### Round 7 推荐路线
+
+**Route B（最优）: 减少 hextet tail/head 浪费**
+- 当前 overhead：28 cycles/hextet（P 组 hash+idx 尾巴约 5-9c 空洞 + head 启动浪费）
+- 目标：92 → ~75 cycles/hextet（节省 17c × 2 hextets × 10 rounds = 340c）
+- 预期结果：2908 - 340 = **~2570 cycles**
+
+**Route A2（次优）: special-case mod3（rounds 3, 14，8 节点）**
+- mod3 idx ∈ {7..14}，用 3 位分解：bit0, bit1, bit2 各一次 multiply_add
+- 9 valu ops/group vs 8 load_offset/group，节省 ~90c（2 mod3 rounds × 45c）
+- 预期结果：2908 - 90 = **~2820 cycles**
+
+**Route B+A2（组合）**
+- 预期：**~2480 cycles**
+- 仍需 >1.6× 进一步降低以达 1487
+
+**根本路线（非常困难）**：
+- 不能预缓存所有 1023 个 forest 值（1023 + 791 min scratch = 1814 > 1536 limit）
+- 需要某种根本性的 load 绕过机制，例如减少 batch_size 或者找到 idx 分布规律
+
+---
+
+## Round 5: 早期 round 特判 (mod 0/1) (2026-04-10)
+
+- 候选 005（early-round special-casing mod 0+1）: **2,966 cycles** — ACCEPT，merged（commit 3e9d7d4）
+- 改进：3,132 → 2,966 cycles（5.3% 降低，49.8x over baseline）
+
+### 005 技术细节
+- **round_mod==0（rounds 0, 11）**：所有 idx=0，单次 scalar load forest_values[0] + vbroadcast，跳过 32×8=256 次 load_offset，使用 `emit_hextet_noload` 
+- **round_mod==1（rounds 1, 12）**：idx ∈ {1,2}，2 次 scalar load + vbroadcast，per-group flow vselect（使用 `addr_tmp_g[g]` 作为 per-group lsb_cond scratch，避免 WAW），使用 `emit_hextet_vselect2`
+- **mod 2-10, 13-15**：沿用 16-group hextet pipeline
+- Scratch 使用：1378/1536（158 words 剩余）
+
+### Cycle 分解（精确测量）
+| 类型 | rounds 数量 | 总 cycles |
+|------|-------------|----------|
+| Setup（固定） | — | 121c |
+| mod0 rounds | 2（round 0, 11）| 319c（193+126） |
+| mod1 rounds | 2（round 1, 12）| 318c（159×2） |
+| normal rounds | 12（mod 2-10, 13-15）| 2208c（184c×12） |
+| **合计** | | **2966c** |
+
+### Round 6 瓶颈分析
+
+正常 round（12 个）贡献 2208/2966 = **74.4%** 的 cycles，每 hextet 实际 92c vs 理论下限 64c（128 load_offset / 2 = 64c）。
+
+关键发现：valu `multiply_add` 可以替代 `flow vselect`！
+- `nv = node2 + (node1-node2)*lsb = multiply_add(node2_vec, diff_vec, lsb_vec)`
+- 消除 16 个串行 flow vselect（每 hextet 16c 瓶颈）
+- 同样原理可扩展到 mod2 的 4-node 选择（8 valu ops/group vs 8 load_offset/group，但 valu 吞吐 6x）
+
+### Round 6 推荐路线
+
+**首选：Option C + A（valu 算术 vselect + mod2 特判）**
+1. **mod1 优化**：用 `multiply_add` 替代 `flow vselect`，消除 16c/hextet 串行化，节省 ~64c（2 mod1 rounds × 2 hextets）
+2. **mod2 特判（rounds 2, 13）**：`bit0=idx&1`, `bit1=(idx-3)>>1`, 2 次 multiply_add 选 4 节点，8 valu ops/group vs 8 load_offset/group，节省 ~108c（每 hextet 从 92c 降到 ~63c）
+3. 总预期节省 ~170c → **目标 ~2796 cycles**
+
+**备选：Option B（mod0 hextet 调度优化）**
+- 理论 49c/hextet，当前 80c/hextet（avg），gap = 31c/hextet
+- 如能达到 55c/hextet：节省 50c/round × 2 rounds = 100c
+- 风险高，且不及 valu-select 路线收益明显
 
 ---
 

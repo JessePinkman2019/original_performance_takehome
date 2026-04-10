@@ -4,12 +4,11 @@
   "target_cycles": 1487,
   "stretch_target": 1363,
   "current_best": {
-    "cycles": 3132,
-    "commit": "6be33f1",
-    "branch": "attempt-004a",
-    "technique": "16_group_hextet_pipeline_plus_setup_packing",
-    "per_group_cycles": 6.1172,
-    "speedup_over_baseline": 47.17
+    "cycles": 2908,
+    "commit": "a876a68",
+    "technique": "16group_pipeline_early_round_special_mod012",
+    "per_group_cycles": 5.68,
+    "speedup_over_baseline": 3.42
   },
   "known_bottlenecks": {
     "load": "8× load_offset per group → 4 cycles (load×2 slot limit)",
@@ -297,6 +296,187 @@
       },
       "round5_recommendation": "Fix 004b early-round special-casing bug: use per-group dedicated scratch for vsel4_nv_hi/vsel4_b_in_lo instead of shared. Also apply 16-group hextet pipeline to NORMAL rounds in 004b (currently falls back to 8-octet). Combined target: ~2500-2800 cycles.",
       "selected_winner": true
+    },
+    {
+      "type": "generator_started",
+      "attempt_id": "005",
+      "timestamp": "2026-04-10T17:52:11.343586",
+      "worktree": ".claude/worktrees/attempt-005",
+      "status": "cancelled",
+      "cancel_reason": "premature launch: 004b background agent not yet completed"
+    },
+    {
+      "type": "generator_done",
+      "attempt_id": "004b",
+      "timestamp": "2026-04-10T18:15:02.227689",
+      "worktree": ".claude/worktrees/attempt-004b",
+      "self_reported_cycles": 3050,
+      "status": "partial_success",
+      "improvement_pct": 2.62,
+      "cycles_before": 3132,
+      "cycles_after": 3050,
+      "commit": "11ee52b",
+      "thresholds_passed": [
+        "test_kernel_correctness (< 18532)"
+      ],
+      "key_insight": "Special round pipeline (8-group) is slower than hextet; need to combine 16-group pipeline with special xor for real benefit",
+      "correctness_bugs_found": [
+        "vsel4_nv_hi conflicted with t1_tmp_pair[0]",
+        "emit_8group_special wrong xor interleaving positions",
+        "double-xor in round_mod==2"
+      ]
+    },
+    {
+      "type": "generator_started",
+      "attempt_id": "005",
+      "timestamp": "2026-04-10T19:59:33.665816",
+      "worktree": ".claude/worktrees/attempt-005"
+    },
+    {
+      "type": "generator_done",
+      "attempt_id": "005",
+      "timestamp": "2026-04-10T20:14:30.696832",
+      "worktree": ".claude/worktrees/attempt-005",
+      "self_reported_cycles": 2966,
+      "status": "success",
+      "improvement_pct": 5.3,
+      "cycles_before": 3132,
+      "cycles_after": 2966,
+      "commit": "d6b59d5",
+      "thresholds_passed": [
+        "test_kernel_correctness (< 18532)",
+        "test_round4_sonnet (< 3344)",
+        "test_round4_combined (< 2975 → 2966 PASS)"
+      ],
+      "key_optimizations": [
+        "round_mod==0 (rounds 0,11): broadcast single forest_values[0], skip 32x8=256 load_offsets",
+        "round_mod==1 (rounds 1,12): 2-node vselect using per-group addr_tmp_g as lsb_cond scratch",
+        "round_mod==2-10,14-15: unchanged 16-group hextet pipeline"
+      ],
+      "bugs_fixed_vs_004b": [
+        "noload hextet uses correct normal-hextet diagonal (pair-safe ordering)",
+        "vselect hextet uses per-group addr_tmp_g (not shared lsb_tmp_pair)",
+        "setup slots emitted as (engine,slot) tuples into body (correct format)"
+      ]
+    },
+    {
+      "type": "evaluator_result",
+      "attempt_id": "005",
+      "timestamp": "2026-04-10T20:22:43.805357",
+      "cycles_before": 3132,
+      "cycles_after": 2966,
+      "improvement_pct": 5.3,
+      "passed": true,
+      "thresholds_passed": [
+        "test_baseline_60x (< 147734)",
+        "test_baseline_15x (< 18532)",
+        "test_round4_combined (< 2975)"
+      ],
+      "thresholds_failed": [
+        "test_opus4_many_hours (< 2164)",
+        "test_opus45_casual (< 1790)",
+        "test_sonnet45_many_hours (< 1548)",
+        "test_opus45_2hr (< 1579)",
+        "test_opus45_11hr (< 1487)",
+        "test_opus45_improved_harness (< 1363)"
+      ],
+      "bottleneck_analysis": {
+        "setup_cycles": 121,
+        "mod0_rounds_cycles": 319,
+        "mod1_rounds_cycles": 318,
+        "normal_rounds_cycles": 2208,
+        "normal_rounds_count": 12,
+        "per_normal_round": 184,
+        "per_normal_hextet": 92,
+        "normal_load_bottleneck": "128 load_offset / 2 slots = 64 cycles/hextet (theoretical)",
+        "mod0_per_hextet": 80,
+        "mod0_theoretical_per_hextet": 49,
+        "mod1_bottleneck": "16 flow vselects serialized = 16c floor per hextet",
+        "round6_saving_potential": 170
+      },
+      "round6_recommendation": "Option C+A: Replace flow vselect with valu multiply_add trick for mod1 rounds (eliminate 16c flow serialization bottleneck per hextet, save ~64c for 2 mod1 rounds). Then extend to mod2 special-casing using 2-level arithmetic vselect: bit0=idx&1 for lo/hi, bit1=(idx-3)>>1 for final select, 8 valu ops/group vs 8 load_offset/group but at 6x throughput. Estimated total savings ~170c -> target ~2796 cycles."
+    },
+    {
+      "type": "merged",
+      "attempt_id": "005",
+      "timestamp": "2026-04-10T20:22:43.805367",
+      "commit": "3e9d7d4",
+      "new_best": 2966
+    },
+    {
+      "type": "generator_started",
+      "attempt_id": "006",
+      "timestamp": "2026-04-10T20:25:04.734243",
+      "worktree": ".claude/worktrees/attempt-006"
+    },
+    {
+      "type": "generator_checkpoint",
+      "attempt_id": "006",
+      "timestamp": "2026-04-10T20:42:19.502982",
+      "progress": "Optimization 2 (mod2 4-node arith) done: 2966→2908 cycles. Starting Opt 1 (mod1 valu vselect).",
+      "cycles_so_far": 2908
+    },
+    {
+      "type": "generator_done",
+      "attempt_id": "006",
+      "timestamp": "2026-04-10T20:44:40.864301",
+      "cycles": 2908,
+      "prev_best": 2966,
+      "improvement": 58,
+      "status": "success",
+      "optimizations_implemented": [
+        "mod1 valu arithmetic vselect: replaced flow.vselect with multiply_add arithmetic (lsb * diff + node2)",
+        "mod2 4-node arithmetic select: replaced 8x load_offset with 8-step valu arithmetic using bit decomposition"
+      ],
+      "notes": "mod2 arith4 required careful quartet-based emission ordering to prevent pair-reuse WAW hazard"
+    },
+    {
+      "type": "evaluator_result",
+      "attempt_id": "006",
+      "timestamp": "2026-04-10T20:54:11.018585",
+      "cycles_before": 2966,
+      "cycles_after": 2908,
+      "improvement_pct": 1.96,
+      "passed": true,
+      "improvement_type": "small",
+      "note": "accepted despite <5% improvement; positive direction confirmed",
+      "thresholds_passed": [
+        "test_baseline_60x (< 147734)",
+        "test_baseline_15x (< 18532)",
+        "test_round4_combined (< 2975)"
+      ],
+      "thresholds_failed": [
+        "test_opus4_many_hours (< 2164)",
+        "test_opus45_casual (< 1790)",
+        "test_sonnet45_many_hours (< 1548)",
+        "test_opus45_2hr (< 1579)",
+        "test_opus45_11hr (< 1487)",
+        "test_opus45_improved_harness (< 1363)"
+      ],
+      "bottleneck_analysis": {
+        "setup_cycles": 188,
+        "mod0_rounds_cycles": 254,
+        "mod1_rounds_cycles": 280,
+        "mod2_rounds_cycles": 348,
+        "normal_rounds_cycles": 1840,
+        "normal_rounds_count": 10,
+        "per_normal_round": 184,
+        "per_normal_hextet": 92,
+        "normal_load_bottleneck": "128 load_offset / 2 slots = 64 cycles/hextet (theoretical min)",
+        "normal_overhead_per_hextet": 28,
+        "normal_fraction": "63.3% of total cycles",
+        "path_to_1487": "Normal rounds at 1840 (63%) dominate; need reduction from 184→42 per round to hit target with current special round costs – nearly impossible by load physics. Real path: combine special-casing more rounds (mod3,mod4) + hextet tail optimization + possibly setup reduction.",
+        "hextet_tail_waste": "~5-9 cycles at tail (P group finishing while others done)",
+        "forest_precache_blocked": "Scratch space insufficient: need 1023 forest vals + 791 min scratch = 1814 > 1536 limit"
+      },
+      "round7_recommendation": "Route B+A2: (1) Optimize normal hextet tail/head scheduling to reduce 92->~75 cycles/hextet (save ~340 total), estimated 2570 cycles. (2) Special-case mod3 (8 nodes, bit decomposition with 3 valu ops/group), save ~90 more, reach ~2480. Combined: A2+B is most viable single-round improvement. Route B alone (hextet optimization) is most impactful: close the 28-cycle/hextet overhead gap."
+    },
+    {
+      "type": "merged",
+      "attempt_id": "006",
+      "timestamp": "2026-04-10T20:54:11.018598",
+      "commit": "a876a68",
+      "new_best": 2908
     }
   ]
 }
