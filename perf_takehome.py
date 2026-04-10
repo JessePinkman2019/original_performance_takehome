@@ -352,9 +352,15 @@ class KernelBuilder:
         self.instrs.extend(broadcast_instrs)
 
         # --- Load initial idx and val vectors from memory into scratch ---
-        # Scalar address temps for vload/vstore addressing
+        # Scalar address temps for vload/vstore addressing (shared, kept for backward compat)
         addr_scalar = self.alloc_scratch("addr_scalar")
         addr_scalar2 = self.alloc_scratch("addr_scalar2")
+
+        # Per-group addr scalars to eliminate WAW serialization in init and store.
+        # Each group uses its own scalar for idx and val address computation.
+        # 32 groups x 2 = 64 words. Within the 105-word budget.
+        addr_idx_g = [self.alloc_scratch(f"addr_idx_g_{g}") for g in range(n_groups)]
+        addr_val_g = [self.alloc_scratch(f"addr_val_g_{g}") for g in range(n_groups)]
 
         # Pre-compute group offset constants for address computation
         group_offset_scalars = []
@@ -366,14 +372,23 @@ class KernelBuilder:
                 self.const_map[offset_val] = sc
             group_offset_scalars.append(self.const_map[offset_val])
 
+        # OPTIMIZED INIT: emit all idx alu ops first, then all val alu ops, then all vloads.
+        # This eliminates WAW serialization from shared addr_scalar: each group now uses
+        # its own per-group scalar, so all 32 idx alu ops can pack together (3 bundles),
+        # and the packer can interleave alu + vload ops optimally.
         init_load_slots = []
+        # All idx addr computations (32 alu ops, independent -> pack 12/cycle -> 3 cycles)
+        for g in range(n_groups):
+            init_load_slots.append(("alu", ("+", addr_idx_g[g], self.scratch["inp_indices_p"], group_offset_scalars[g])))
+        # All val addr computations (32 alu ops, independent)
+        for g in range(n_groups):
+            init_load_slots.append(("alu", ("+", addr_val_g[g], self.scratch["inp_values_p"], group_offset_scalars[g])))
+        # All vloads (interleaved: idx then val per group so packer can fill 2 load slots/cycle)
         for g in range(n_groups):
             idx_addr = idx_base + g * VLEN
             val_addr = val_base + g * VLEN
-            init_load_slots.append(("alu", ("+", addr_scalar, self.scratch["inp_indices_p"], group_offset_scalars[g])))
-            init_load_slots.append(("load", ("vload", idx_addr, addr_scalar)))
-            init_load_slots.append(("alu", ("+", addr_scalar2, self.scratch["inp_values_p"], group_offset_scalars[g])))
-            init_load_slots.append(("load", ("vload", val_addr, addr_scalar2)))
+            init_load_slots.append(("load", ("vload", idx_addr, addr_idx_g[g])))
+            init_load_slots.append(("load", ("vload", val_addr, addr_val_g[g])))
 
         init_instrs = self.build(init_load_slots)
         self.instrs.extend(init_instrs)
@@ -566,44 +581,50 @@ class KernelBuilder:
 
             # Follow the exact same diagonal ordering as normal hextet,
             # but replacing addr+load with xor(bcast) at the appropriate positions.
-            # In the normal hextet:
-            #   Step 1: A.addr   → replace with A.xor (no load dependency)
-            #   Step 2: A.load+B.addr → replace with B.xor
-            #   Step 3: A.xor+B.load+C.addr → skip (A already done above)
-            # Simplification: emit all xors first (A-P), then follow the hash+idx diagonal
-            # without the load slots. This is safe because:
-            #   - gA uses pair 0 for hash; by step 13+ gA is done with t1/t2_pair[0]
-            #   - gE also uses pair 0 but starts hash later (step 19+ in normal); same here
-            #   - The relative ordering of hash[A] vs hash[E] is maintained by the diagonal
+            # OPTIMIZATION: pipeline xors with hash for early groups.
+            # A.xor completes in cycle 1 (along with B-F). A.hash[0] can start in cycle 2
+            # (after A.xor result is available) while G-K finish their xors in cycle 2.
+            # This saves ~2 cycles versus emitting all 16 xors then starting hash.
+            #
+            # Pipelined emission order:
+            # Cycle 1: [A-F xor]                     (6 valu, 1 cycle)
+            # Cycle 2: [G-K xor + A.hash[0]]         (6 valu: G,H,I,J,K xors + A.hash[0])
+            # Cycle 3: [L-P xor + A.hash[1:3] + B.hash[0]] but that's 5+3=8 > 6
+            #   → split: [L,M,N,o_xor, A.hash[1], A.hash[2]] (6) then p_xor+B.hash[0] ...
+            # Actually let build() handle packing naturally - just emit in the right order:
+            # After A-K xors done: emit a_hash[0], then continue with remaining xors + hash diagonal.
 
-            # Xors for all 16 groups (A-P): 16 valu ops, packs to 3 cycles
+            # Cycle 1: A-F xors (6 ops, 1 cycle)
             body.extend(a_xor)
             body.extend(b_xor)
             body.extend(c_xor)
             body.extend(d_xor)
             body.extend(e_xor)
             body.extend(f_xor)
+            # Cycle 2: G-K xors + A.hash[0] (6 ops: packer will fit them together since
+            # A.hash[0] reads val_base+0*VLEN written in cycle 1 = a_xor → RAW forces new cycle,
+            # but G-K xors are independent → packer packs them with A.hash[0] in cycle 2)
             body.extend(g_xor)
             body.extend(h_xor)
             body.extend(i_xor)
             body.extend(j_xor)
             body.extend(k_xor)
+            body.append(a_hash[0])
+            # Cycle 3: L-P xors + A.hash[1:3] + B.hash[0]
+            # L-P = 5 xors, a_hash[1], a_hash[2], b_hash[0] = 8 ops → 2 cycles
+            # Let build() pack: [L,M,N xor + a.hash[1], a.hash[2], b.hash[0]] = 6, [O,P xor] = 2
             body.extend(l_xor)
             body.extend(m_xor)
             body.extend(n_xor)
-            body.extend(o_xor)
-            body.extend(p_xor)
-
-            # Hash+idx diagonal (same order as normal hextet steps 4-63, minus loads/addrs)
-            # Step 4 equivalent: A.hash[0] + B (already xored)
-            body.append(a_hash[0])
-
-            # Step 5: A.hash[1:3] + B.hash[0]
             body.append(a_hash[1])
             body.append(a_hash[2])
             body.append(b_hash[0])
+            # Remaining xors: O, P  (+ continuing hash diagonal)
+            body.extend(o_xor)
+            body.extend(p_xor)
 
-            # Step 6: A.hash[3] + B.hash[1:3] + C.hash[0]
+            # Continue hash+idx diagonal from where we left off (A.hash[3] onward)
+            # Step 6 equivalent: A.hash[3] + B.hash[1:3] + C.hash[0]
             body.append(a_hash[3])
             body.append(b_hash[1])
             body.append(b_hash[2])
@@ -2662,14 +2683,21 @@ class KernelBuilder:
                 emit_hextet_tail_steps50_63(body, s1, next_s=s0_next)
 
         # --- Store final idx and val vectors back to memory ---
+        # OPTIMIZED STORE: emit all idx alu ops first, then all val alu ops, then all vstores.
+        # Per-group scalars eliminate WAW serialization (same as init optimization).
         store_slots = []
+        # All idx addr computations (32 alu ops, independent -> pack 12/cycle -> 3 cycles)
+        for g in range(n_groups):
+            store_slots.append(("alu", ("+", addr_idx_g[g], self.scratch["inp_indices_p"], group_offset_scalars[g])))
+        # All val addr computations (32 alu ops, independent)
+        for g in range(n_groups):
+            store_slots.append(("alu", ("+", addr_val_g[g], self.scratch["inp_values_p"], group_offset_scalars[g])))
+        # All vstores (interleaved: idx then val per group so packer fills 2 store slots/cycle)
         for g in range(n_groups):
             idx_addr = idx_base + g * VLEN
             val_addr = val_base + g * VLEN
-            store_slots.append(("alu", ("+", addr_scalar, self.scratch["inp_indices_p"], group_offset_scalars[g])))
-            store_slots.append(("store", ("vstore", addr_scalar, idx_addr)))
-            store_slots.append(("alu", ("+", addr_scalar2, self.scratch["inp_values_p"], group_offset_scalars[g])))
-            store_slots.append(("store", ("vstore", addr_scalar2, val_addr)))
+            store_slots.append(("store", ("vstore", addr_idx_g[g], idx_addr)))
+            store_slots.append(("store", ("vstore", addr_val_g[g], val_addr)))
 
         # Build the main body with VLIW packing
         body_instrs = self.build(body)
