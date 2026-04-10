@@ -4,10 +4,10 @@
   "target_cycles": 1487,
   "stretch_target": 1363,
   "current_best": {
-    "cycles": 2580,
-    "commit": "3bde59b",
-    "technique": "per_group_addr_plus_noload_xor_pipeline",
-    "speedup_over_original_baseline": 57.26
+    "cycles": 2555,
+    "commit": "e72876a",
+    "technique": "setup_batching_plus_mod0_xor_injection",
+    "speedup_over_original_baseline": 57.82
   },
   "known_bottlenecks": {
     "load": "8× load_offset per group → 4 cycles (load×2 slot limit)",
@@ -787,6 +787,67 @@
       "attempt_id": "010",
       "commit": "3bde59b",
       "new_best": 2580
+    },
+    {
+      "type": "planner_decision",
+      "attempt_id": "011",
+      "timestamp": "2026-04-11T01:46:10.633733",
+      "technique": "setup_batching_plus_xor_injection",
+      "expected_cycles": 2534,
+      "success_threshold": 2560,
+      "abort_threshold": 2580,
+      "plan_file": "ROUND_PLAN_11.json",
+      "recommendation": "IMPLEMENT_A_AND_B: setup const batching (-21c) + hextet tail xor injection (-25c)",
+      "key_learning": "Fundamental hash dep chain barrier (depth 9, 14 extra cycles/hextet) prevents reaching 2164 threshold. Max achievable with current architecture: ~2508-2534. Setup has 21 avoidable wasted cycles from unbatched const loads. Hextet0 tail has 47 free valu slots that can absorb hextet1 xors in special rounds (saves 3c each) and normal rounds (saves 1c each). Load engine has 8 free slots in tail when intra_hextet_s used.",
+      "reasoning": "Full bottleneck analysis: normal rounds 1822c (10*182c, overhead=54c/round from hash dep chain), special rounds 666c (6*111c, overhead=31c/round), setup 92c (21c wasted on unbatched consts). All RAW dep chains confirmed irreducible. Hextet overlap already maximized for loads. Unexplored: (1) setup const batching - trivial 21c savings; (2) xor injection into hextet0 tail free valu slots - 25c savings; (3) free load slots in intra_tail_next_s - 8c savings. Combined max ~46-72c improvement projects to 2508-2534. CANNOT reach 2164 threshold with any combination of these improvements alone."
+    },
+    {
+      "type": "generator_started",
+      "attempt_id": "011",
+      "timestamp": "2026-04-11T01:48:16.362198",
+      "worktree": ".claude/worktrees/attempt-011"
+    },
+    {
+      "type": "generator_done",
+      "attempt_id": "011",
+      "timestamp": "2026-04-11T01:52:42.781689",
+      "cycles": 2555,
+      "improved": true,
+      "delta": -25,
+      "optimizations_applied": [
+        "setup_batching_A",
+        "xor_injection_B_mod0"
+      ],
+      "worktree": ".claude/worktrees/attempt-011"
+    },
+    {
+      "type": "evaluator_result",
+      "attempt_id": "011",
+      "timestamp": "2026-04-11T01:54:13.029809",
+      "cycles_before": 2580,
+      "cycles_after": 2555,
+      "improvement_pct": 0.97,
+      "passed": true,
+      "thresholds_passed": [
+        "baseline_147734",
+        "test_baseline_60x",
+        "test_baseline_20x",
+        "test_baseline_15x"
+      ],
+      "thresholds_failed": [
+        "test_opus4_many_hours_2164",
+        "test_opus45_casual_1790",
+        "test_sonnet45_many_hours_1548",
+        "test_opus45_2hr_1579",
+        "test_opus45_11hr_1487",
+        "test_opus45_improved_harness_1363"
+      ]
+    },
+    {
+      "type": "merged",
+      "attempt_id": "011",
+      "commit": "e72876a",
+      "new_best": 2555
     }
   ]
 }

@@ -14,9 +14,28 @@
 | 早期 round 特判 (mod 0/1/2) | 2,908 | 50.8x |
 | hextet 跨边界 tail/head 重叠 | 2,668 | 55.4x |
 | addr 预取 + intra-hextet 流水线 | 2,638 | 56.0x |
-| **per-group addr scalars + noload xor pipeline** | **2,580** | **57.3x** |
+| per-group addr scalars + noload xor pipeline | 2,580 | 57.3x |
+| **setup batching + mod0 xor injection** | **2,555** | **57.8x** |
 
 通过测试：所有 < 147734 及 < 18532 及 baseline_updated，但未通过 < 2164（需继续优化）
+
+---
+
+## Round 11: setup batching + mod0 xor injection (2026-04-10)
+
+- 候选 011（setup batching + mod0 xor injection）: **2,555 cycles** — ACCEPT，merged（commit e72876a）
+- 改进：2,580 → 2,555 cycles（0.97% 降低，57.8x over baseline）
+
+### 011 技术细节
+- **setup const batching**：将 init 阶段的常量 load/broadcast 操作从单发（1/cycle）改为批量打包（const 2/cycle, vbroadcast 6/cycle），减少 setup 阶段 ~21 cycles 的浪费
+- **mod0 xor injection**：在 noload hextet 的 tail 中，将 hextet1 的 A-F groups xor 操作注入到 hextet0 tail 的空闲 valu slots 中，使 xor 与 idx_update 并行执行，节省约 25 cycles
+
+### Round 11 引擎利用率
+| 引擎 | 改进方向 | 节省 |
+|------|---------|------|
+| valu | setup batching 消除串行 const load | ~21c |
+| valu | hextet tail xor 注入 | ~4c |
+| 合计 | | **~25c** |
 
 ---
 
