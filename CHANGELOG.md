@@ -35,6 +35,31 @@
 
 ---
 
+## Round 3: 8-group 跨组流水线 (octet pipeline) (2026-04-10)
+
+- 候选 003（8-group octet pipeline）: 3,344 cycles（改进 19.9%，44.2x over baseline）
+- ACCEPT，merged（commit 0056419）
+- 实际 cycles: 3344（Generator 报告一致）
+- 主要分析（Evaluator 深度诊断）：
+  - Main body 实际 3,139 cycles，setup 141 cycles，共 3,344
+  - 每 octet 实际 49 cycles（期望 35），效率 71.4%
+  - **核心浪费：1091 cycles（34.7%）load 引擎完全空闲**
+  - load 活跃期间 valu 只用 41%（2.47/6 slots）
+  - load 理论下限：4096 ops / 2 = 2048 cycles；valu 理论下限：9728 / 6 = 1621 cycles
+  - **目标 1487 < load 下限 2048 → 必须减少 load 次数**
+- 关键发现：idx 值**周期性重置**
+  - Round 0 和 11：所有 256 个元素 idx=0（一个树节点）
+  - Round 1,12：idx 只有 {1,2}（两个节点）
+  - Round 2,13：idx 只有 {3,4,5,6}（四个节点）
+  - Round 3,14：idx 只有 8 个节点
+  - 这个结构可以大幅减少早期 round 的 load 次数
+- 下一步建议（Round 4 三轨策略）：
+  1. **Setup 打包优化（低风险）**：用 build() 替代 add() 批量发射，const 2 个/cycle，vbroadcast 6 个/cycle，setup 从 141 降至 ~50 cycles
+  2. **16-group 流水线（中等难度，~900 cycle 节省）**：比 8-group 更宽，需 8 对 t1/t2/lsb/cmp（128 words extra），scratch = 1471 < 1536，目标 70 cycles/16-group 批次
+  3. **早期 round 特判（高难度，可能触及目标）**：Round 0/11 用 1 次 scalar load + broadcast；Round 1/12 用 2 次 load + vselect；可节省 ~1100 load ops。但 valu 随之成为瓶颈（需要 vselect 级联）
+
+---
+
 ## Round 2: 4-group 跨组流水线 (2026-04-10)
 
 - 候选 002a（3-group 流水线）: 5,056 cycles（改进 17.1%，通过 5791 阈值）
