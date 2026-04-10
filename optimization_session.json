@@ -4,10 +4,12 @@
   "target_cycles": 1487,
   "stretch_target": 1363,
   "current_best": {
-    "cycles": 3344,
-    "commit": "attempt-003",
-    "technique": "cross_group_pipeline_8way",
-    "per_group_cycles": 6.5312
+    "cycles": 3132,
+    "commit": "6be33f1",
+    "branch": "attempt-004a",
+    "technique": "16_group_hextet_pipeline_plus_setup_packing",
+    "per_group_cycles": 6.1172,
+    "speedup_over_baseline": 47.17
   },
   "known_bottlenecks": {
     "load": "8× load_offset per group → 4 cycles (load×2 slot limit)",
@@ -223,6 +225,78 @@
         "scratch_status": "1343/1536 used, 193 free"
       },
       "round4_recommendation": "THREE TRACKS IN PRIORITY ORDER: (1) SETUP PACKING [easy, ~100 cycle savings]: Replace all add() calls in setup with build()-based batching. Pack const loads 2/cycle (currently 1 each), pack vbroadcasts 6/cycle (currently 1 each). Reduces setup from 141 to ~50 cycles. (2) WIDER PIPELINE [medium, ~900 cycle savings]: Implement 16-group or 32-group pipeline instead of 8-group. Key advantage: better load/valu interleaving with more groups in flight. With 8 pair temps (128 extra scratch words, fits in 193 free), can handle 16 groups safely. Design explicit schedule for 16-group batch targeting 64-70 cycles per batch (vs current 49 cycles per 8-group = 98 for same 16 groups). (3) EARLY ROUND SPECIAL CASING [hard, potentially reach target]: For rounds 0 and 11 (idx=0 for all), use 1 scalar load + broadcast instead of 8 load_offset per group. For rounds 1,12 (idx in {1,2}), use 2 scalar loads + 1 vselect per group. For rounds 2,13 (idx in {3..6}), use 4 loads + vselect tree. This replaces 1536 load ops with ~100 loads + extra valu. BUT: valu becomes bottleneck (estimated 1800+ min cycles). The path to <1487 REQUIRES BOTH: a) reducing early-round loads (rounds 0-3,11-14) from 2048 to ~400 load ops AND b) reducing hash valu ops (cannot use multiply_add for stages 1,3,5 which cost 3 ops each). Possible hash optimization: eliminate zero_vec by using alu for idx bounds check instead of valu. MOST PROMISING: Attack setup overhead first (low risk), then try 16-group pipeline, measure result. If that achieves ~2000 cycles, then add early-round special casing."
+    },
+    {
+      "type": "planner_decision",
+      "attempt_id": "004",
+      "timestamp": "2026-04-10T17:30:00.000000",
+      "technique": "combined_16group_pipeline_plus_early_round_special_cases_plus_setup_packing",
+      "reasoning": "After careful verification: ALL 256 elements start with idx=0 (confirmed in frozen_problem.py Input.generate()). Tree height=10, n_nodes=2047. The period is exactly 11 rounds: after round 10, all leaf indices produce 2*idx+(1or2)>=2047, so ALL reset to 0. With rounds=16: rounds 0,11 have idx=0; rounds 1,12 have idx∈{1,2}; rounds 2,13 have idx∈{3,4,5,6}; rounds 3,14 have idx∈{7..14}; rounds 4-10,15 are normal. THREE parallel optimizations: (A) Setup packing: 12 vbroadcasts packed 6/cycle saves ~90 cycles from 141-cycle setup. (B) 16-group pipeline: extends 8-group octet to 16-group, better load/valu interleaving, targets ~67 cycles per 16-group batch vs current 98 cycles (2×49) for same 16 groups → estimates ~2285 total. (C) Early-round special-casing for rounds 0,11 (1 load + shared vbroadcast + 32 xor = ~104 cycles vs 196), rounds 1,12 (2 loads + 32 vselect-on-idx + hash + idx = ~140 cycles), rounds 2,13 (4 loads + 64 vselect + hash + idx = ~160 cycles). Combined estimate: ~1815 cycles. If still above 1487, extend to 32-group pipeline. Key correctness constraint: for type_1 vselect (round 1,12), the vselect condition is on CURRENT idx (not hashed val) — idx∈{1,2}, so lsb of idx=1 selects node[1], lsb of idx=0 selects node[2]. Two parallel tracks: (004a) 16-group pipeline + setup packing; (004b) early-round special-cases on existing 8-group + setup packing. Measure both, then combine winner.",
+      "parallel_plans": [
+        "004a: 16-group pipeline + setup packing — expected ~2285 cycles",
+        "004b: early-round special-cases (rounds 0,1,2,11,12,13) on 8-group + setup packing — expected ~2600 cycles",
+        "004c (if needed): combine 16-group + special-cases — expected ~1815 cycles"
+      ],
+      "abort_threshold": 3400,
+      "success_threshold": 3177,
+      "stretch_target": 1487,
+      "plan_file": "ROUND_PLAN_4.json"
+    },
+    {
+      "type": "generator_started",
+      "attempt_id": "004a",
+      "timestamp": "2026-04-10T17:15:30.938296",
+      "worktree": ".claude/worktrees/attempt-004a"
+    },
+    {
+      "type": "generator_started",
+      "attempt_id": "004b",
+      "timestamp": "2026-04-10T17:16:10.415135",
+      "worktree": ".claude/worktrees/attempt-004b",
+      "strategy": "early_round_special_cases_plus_setup_packing"
+    },
+    {
+      "type": "generator_done",
+      "attempt_id": "004a",
+      "timestamp": "2026-04-10T17:41:52.212807",
+      "worktree": ".claude/worktrees/attempt-004a",
+      "self_reported_cycles": 3132,
+      "cycles_before": 3344,
+      "cycles_after": 3132,
+      "improvement_pct": 6.34,
+      "status": "success",
+      "commit": "1f777ee",
+      "note": "16-group hextet pipeline + setup packing. Frozen problem confirms 3132 cycles. 94 actual cycles/hextet vs 98 for two sequential octets (4 cycle saving per hextet). Tail issue: I-P hash+idx runs 27 cycles pure valu after all loads done."
+    },
+    {
+      "type": "evaluator_result",
+      "attempt_id": "004b",
+      "timestamp": "2026-04-10T17:47:52.455357",
+      "cycles_before": 3344,
+      "cycles_after": null,
+      "passed": false,
+      "reject_reason": "correctness failure: vsel4_nv_hi and vsel4_b_in_lo are SHARED scratch across all 8 groups in octet, causing WAW corruption — d_vsx4[2] overwrites vsel4_nv_hi before d_vsx4[4] reads it when e_vsx4[2] interleaves. Round mod 2 (round_mod==2) special-casing broken.",
+      "selected_winner": false
+    },
+    {
+      "type": "evaluator_result",
+      "attempt_id": "004a",
+      "timestamp": "2026-04-10T17:47:52.455364",
+      "cycles_before": 3344,
+      "cycles_after": 3132,
+      "improvement_pct": 6.34,
+      "passed": true,
+      "threshold_met": "test_round4_sonnet (< 3344*0.95=3177 → 3132 PASS)",
+      "bottleneck_analysis": {
+        "current_cycles_per_hextet": 97.9,
+        "target_cycles_per_hextet": 46.5,
+        "scratch_used": 1351,
+        "scratch_remaining": 185,
+        "notes": "16-group hextet pipeline: 32 groups in 2 hextets of 16. 3132/32=97.9c/hextet. Normal rounds use 8-octet pipeline (slower). Early rounds (mod 0,1,2) are special-cased in 004b design but broken.",
+        "early_round_saving_potential": "~255 cycles (rounds 0,11) + ~120 (rounds 1,12) if correctness fixed"
+      },
+      "round5_recommendation": "Fix 004b early-round special-casing bug: use per-group dedicated scratch for vsel4_nv_hi/vsel4_b_in_lo instead of shared. Also apply 16-group hextet pipeline to NORMAL rounds in 004b (currently falls back to 8-octet). Combined target: ~2500-2800 cycles.",
+      "selected_winner": true
     }
   ]
 }

@@ -6,9 +6,45 @@
 |------|--------|--------------|
 | 原始 baseline | 147,734 | 1.00x |
 | VLIW 贪心打包 | 98,583 | 1.50x |
-| **SIMD 向量化 + multiply_add** | **9,936** | **14.87x** |
+| SIMD 向量化 + multiply_add | 9,936 | 14.87x |
+| 4-group 流水线 | 4,176 | 35.4x |
+| 8-group octet 流水线 | 3,344 | 44.2x |
+| **16-group hextet 流水线 + setup 打包** | **3,132** | **47.2x** |
 
-通过测试：`test_kernel_speedup` + `test_kernel_updated_starting_point` + `test_kernel_correctness`（3/9）
+通过测试：`test_kernel_speedup` + `test_kernel_updated_starting_point` + `test_kernel_correctness` + `test_round4_sonnet`（尚待确认阈值名称）
+
+---
+
+## Round 4: 16-group hextet 流水线 + setup 打包 (2026-04-10)
+
+- 候选 004a（16-group hextet pipeline）: **3,132 cycles** — ACCEPT，merged（commit 6be33f1）
+- 候选 004b（early-round special-casing）: REJECT — correctness failure
+- 改进：3,344 → 3,132 cycles（6.3% 降低，47.2x over baseline）
+
+### 004a 技术细节
+- 每 hextet 处理 16 个 group（32 groups / 2 hextets = 2 hextets/round）
+- 16-group 流水：A-D 启动(load+xor) → E-H 跟进 → I-P 在 E-H hash 阶段重叠 load → 共 63 步/hextet
+- Setup 打包：15 个 const load 每 2 个打包（8 cycles），17 个 vbroadcast 每 6 个打包（3 cycles）
+- Scratch 使用：1351/1536（185 words 剩余）
+- 每 hextet 实际：3,132/32 = 97.9 cycles；每 group 平均 6.1 cycles
+
+### 004b Bug 分析
+- 策略：early-round special-casing（round mod 0/1/2 分别用 0/2/4 个 scalar load + vbroadcast/vselect）
+- Bug 根因：`vsel4_nv_hi` 和 `vsel4_b_in_lo` 是**共享** scratch（所有 group 共用同一地址）
+- 代码中注释承认了 Bug（第 958-963 行）："d_vsx4[2] and e_vsx4[2] both write vsel4_nv_hi!"
+- 在 8-group 并行处理时，group B 写 `vsel4_nv_hi` 覆盖了 group A 尚未读取的值
+- 修复方向：为每个 group 分配独立的 `vsel4_nv_hi_g[g]` 和 `vsel4_b_in_lo_g[g]`（需要 32×2×8=512 words）
+- 但 512 words 超过剩余 scratch（185），需要减少 per-group 分配或改用 4-group 特判粒度
+
+### Round 5 路线分析
+- 当前瓶颈：97.9 cycles/hextet vs 目标 46.5 cycles/hextet（需要 2.1x）
+- Normal rounds（mod 3-10，共 9/16 rounds）仍用 8-octet pipeline（每 octet ~49c），drag 整体
+- **最优路线 A**：正常轮也用 16-group hextet（004a 当前已实现）+ fix early-round
+- **最优路线 B**：在 004a 基础上 fix early-round（per-group scratch，scratch 勉强可行）
+  - mod0 round: 1 scalar load + vbroadcast（无需 per-group scratch），节省大量 load cycles
+  - mod1 round: 2 scalars + per-group vselect2（addr_tmp_g[g] 可复用），安全
+  - mod2 round: 4 scalars + 需要 per-group nv_hi 和 b_in_lo，需 scratch 64 words，185 够用
+- **估算**：mod0 2 rounds × ~50c 节省 = ~100c；mod1 2 rounds × ~30c = ~60c → 总 ~2870 cycles
 
 ---
 
