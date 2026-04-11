@@ -260,6 +260,13 @@ class KernelBuilder:
         lsb_tmp_pair = [self.alloc_scratch(f"lsb_tmp_{p}", VLEN) for p in range(4)]
         cmp_tmp_pair = [self.alloc_scratch(f"cmp_tmp_{p}", VLEN) for p in range(4)]
 
+        # OPTIMIZATION (012a): Extend to 8 pairs by reusing lsb/cmp scratch for t1/t2 pairs 4-7.
+        t1_tmp_pair = t1_tmp_pair + lsb_tmp_pair   # pairs 4-7 reuse lsb scratch addresses
+        t2_tmp_pair = t2_tmp_pair + cmp_tmp_pair   # pairs 4-7 reuse cmp scratch addresses
+        # Restore lsb/cmp references for emit_hextet_arith4 (still need original pairs 0-3)
+        lsb_tmp_pair = t1_tmp_pair[4:8]  # same addresses as original lsb_tmp_pair
+        cmp_tmp_pair = t2_tmp_pair[4:8]  # same addresses as original cmp_tmp_pair
+
         zero_vec = self.alloc_scratch("zero_vec", VLEN)
 
         # --- Scalar constants ---
@@ -271,6 +278,9 @@ class KernelBuilder:
         two_scalar = self.alloc_scratch("two_scalar")
         zero_scalar = self.alloc_scratch("zero_scalar")
         three_scalar = self.alloc_scratch("three_scalar_const")
+        four_scalar = self.alloc_scratch("four_scalar_const")
+        five_scalar = self.alloc_scratch("five_scalar_const")
+        six_scalar = self.alloc_scratch("six_scalar_const")
 
         sc_mul_4097 = self.alloc_scratch("mul_4097")
         sc_hash0_const = self.alloc_scratch("hash0_const")
@@ -280,7 +290,7 @@ class KernelBuilder:
         sc_hash2_const = self.alloc_scratch("hash2_const")
         sc_hash3_const = self.alloc_scratch("hash3_const")
         sc_shift_9 = self.alloc_scratch("shift_9")
-        sc_mul_9 = self.alloc_scratch("mul_9")
+        sc_mul_9 = sc_shift_9   # same value 9: reuse same scratch address (saves 1 word + 1 load)
         sc_hash4_const = self.alloc_scratch("hash4_const")
         sc_hash5_const = self.alloc_scratch("hash5_const")
         sc_shift_16 = self.alloc_scratch("shift_16")
@@ -290,6 +300,9 @@ class KernelBuilder:
         self.const_map[2] = two_scalar
         self.const_map[0] = zero_scalar
         self.const_map[3] = three_scalar
+        self.const_map[4] = four_scalar
+        self.const_map[5] = five_scalar
+        self.const_map[6] = six_scalar
         self.const_map[4097] = sc_mul_4097
         self.const_map[0x7ED55D16] = sc_hash0_const
         self.const_map[0xC761C23C] = sc_hash1_const
@@ -307,12 +320,14 @@ class KernelBuilder:
         const_loads = [
             (one_scalar, 1), (two_scalar, 2),
             (zero_scalar, 0), (three_scalar, 3),
-            (sc_mul_4097, 4097), (sc_hash0_const, 0x7ED55D16),
-            (sc_hash1_const, 0xC761C23C), (sc_shift_19, 19),
-            (sc_mul_33, 33), (sc_hash2_const, 0x165667B1),
-            (sc_hash3_const, 0xD3A2646C), (sc_shift_9, 9),
-            (sc_mul_9, 9), (sc_hash4_const, 0xFD7046C5),
-            (sc_hash5_const, 0xB55A4F09), (sc_shift_16, 16),
+            (four_scalar, 4), (five_scalar, 5),
+            (six_scalar, 6), (sc_mul_4097, 4097),
+            (sc_hash0_const, 0x7ED55D16), (sc_hash1_const, 0xC761C23C),
+            (sc_shift_19, 19), (sc_mul_33, 33),
+            (sc_hash2_const, 0x165667B1), (sc_hash3_const, 0xD3A2646C),
+            (sc_shift_9, 9),
+            (sc_hash4_const, 0xFD7046C5), (sc_hash5_const, 0xB55A4F09),
+            (sc_shift_16, 16),
         ]
         for i in range(0, len(const_loads), 2):
             pair = const_loads[i:i+2]
@@ -333,7 +348,7 @@ class KernelBuilder:
         hash2_const_vec = self.alloc_scratch("hash2_const_vec", VLEN)
         hash3_const_vec = self.alloc_scratch("hash3_const_vec", VLEN)
         shift_9_vec = self.alloc_scratch("shift_9_vec", VLEN)
-        mul_9_vec = self.alloc_scratch("mul_9_vec", VLEN)
+        mul_9_vec = shift_9_vec   # same value 9: reuse shift_9_vec scratch (saves 8 words + 1 broadcast)
         hash4_const_vec = self.alloc_scratch("hash4_const_vec", VLEN)
         hash5_const_vec = self.alloc_scratch("hash5_const_vec", VLEN)
         shift_16_vec = self.alloc_scratch("shift_16_vec", VLEN)
@@ -353,7 +368,7 @@ class KernelBuilder:
             ("valu", ("vbroadcast", hash2_const_vec, sc_hash2_const)),
             ("valu", ("vbroadcast", hash3_const_vec, sc_hash3_const)),
             ("valu", ("vbroadcast", shift_9_vec, sc_shift_9)),
-            ("valu", ("vbroadcast", mul_9_vec, sc_mul_9)),
+            # mul_9_vec is aliased to shift_9_vec (same value 9), no separate broadcast needed
             ("valu", ("vbroadcast", hash4_const_vec, sc_hash4_const)),
             ("valu", ("vbroadcast", hash5_const_vec, sc_hash5_const)),
             ("valu", ("vbroadcast", shift_16_vec, sc_shift_16)),
@@ -526,6 +541,59 @@ class KernelBuilder:
             slots.append(("valu", ("*", idx_s, idx_s, cmp)))
             return slots
 
+        # --- Helper: emit hash+idx for an octet (8 groups) in parallel ---
+        def emit_octet_hash_idx_parallel(body, grps, pairs):
+            """Emit hash+idx for 8 groups (grps[0..7]) with 8 distinct pairs (pairs[0..7]).
+            All groups use different pair scratch → fully parallel hash chains.
+            """
+            h = [group_hash_slots(grps[i], pairs[i]) for i in range(8)]
+            ix = [group_idx_slots(grps[i], pairs[i]) for i in range(8)]
+            order_6 = [0, 4, 1, 5, 2, 6]  # first 6 of 8 groups (maximize 6/bundle packing)
+            order_2 = [3, 7]               # remaining 2
+
+            # hash[0]: multiply_add (writes val_s, no pairs) → pack 6+2
+            for i in order_6: body.append(h[i][0])
+            for i in order_2: body.append(h[i][0])
+            # hash[1]+hash[2]: reads val_s (RAW → new bundle). 16 ops → 3 bundles
+            for i in order_6:
+                body.append(h[i][1])
+                body.append(h[i][2])
+            for i in order_2:
+                body.append(h[i][1])
+                body.append(h[i][2])
+            # hash[3]: combine (reads t1/t2). 8 ops → 2 bundles
+            for i in order_6: body.append(h[i][3])
+            for i in order_2: body.append(h[i][3])
+            # hash[4]: multiply_add. 8 ops → 2 bundles
+            for i in order_6: body.append(h[i][4])
+            for i in order_2: body.append(h[i][4])
+            # hash[5]+hash[6]: 16 ops → 3 bundles
+            for i in order_6:
+                body.append(h[i][5])
+                body.append(h[i][6])
+            for i in order_2:
+                body.append(h[i][5])
+                body.append(h[i][6])
+            # hash[7]: combine. 8 ops → 2 bundles
+            for i in order_6: body.append(h[i][7])
+            for i in order_2: body.append(h[i][7])
+            # hash[8]: multiply_add. 8 ops → 2 bundles
+            for i in order_6: body.append(h[i][8])
+            for i in order_2: body.append(h[i][8])
+            # hash[9]+hash[10]: 16 ops → 3 bundles
+            for i in order_6:
+                body.append(h[i][9])
+                body.append(h[i][10])
+            for i in order_2:
+                body.append(h[i][9])
+                body.append(h[i][10])
+            # hash[11]: combine. 8 ops → 2 bundles
+            for i in order_6: body.append(h[i][11])
+            for i in order_2: body.append(h[i][11])
+            # idx[0..4]: 5 levels × 8 ops. Each level has RAW from previous → new bundle per level.
+            for step in range(5):
+                for i in range(8): body.append(ix[i][step])
+
         # --- No-load hextet: pure valu hextet for rounds with broadcast nv ---
         # Uses the same careful diagonal ordering as the normal hextet (just no addr/load).
         # This ensures pair-reuse safety (same as normal hextet).
@@ -544,9 +612,9 @@ class KernelBuilder:
             gM, gN, gO, gP = grp_start+12, grp_start+13, grp_start+14, grp_start+15
             pA=pB=pC=pD=pE=pF=pG=pH=pI=pJ=pK=pL=pM=pN=pO=pP=0
             pA, pB, pC, pD = 0, 1, 2, 3
-            pE, pF, pG, pH = 0, 1, 2, 3
+            pE, pF, pG, pH = 4, 5, 6, 7  # 012a: use extended pairs
             pI, pJ, pK, pL = 0, 1, 2, 3
-            pM, pN, pO, pP = 0, 1, 2, 3
+            pM, pN, pO, pP = 4, 5, 6, 7  # 012a: use extended pairs
 
             a_xor = group_xor_bcast_slots(gA, nv_bcast)
             b_xor = group_xor_bcast_slots(gB, nv_bcast)
@@ -612,417 +680,18 @@ class KernelBuilder:
             # Cycle 3: [L-P xor + A.hash[1:3] + B.hash[0]] but that's 5+3=8 > 6
             #   → split: [L,M,N,o_xor, A.hash[1], A.hash[2]] (6) then p_xor+B.hash[0] ...
             # Actually let build() handle packing naturally - just emit in the right order:
-            # After A-K xors done: emit a_hash[0], then continue with remaining xors + hash diagonal.
-
+            # 012a: Replaced hand-coded diagonal with parallel-octet approach.
             if not skip_xors:
-                # Cycle 1: A-F xors (6 ops, 1 cycle)
-                body.extend(a_xor)
-                body.extend(b_xor)
-                body.extend(c_xor)
-                body.extend(d_xor)
-                body.extend(e_xor)
-                body.extend(f_xor)
-                # Cycle 2: G-K xors + A.hash[0] (6 ops: packer will fit them together since
-                # A.hash[0] reads val_base+0*VLEN written in cycle 1 = a_xor → RAW forces new cycle,
-                # but G-K xors are independent → packer packs them with A.hash[0] in cycle 2)
-                body.extend(g_xor)
-                body.extend(h_xor)
-                body.extend(i_xor)
-                body.extend(j_xor)
-                body.extend(k_xor)
-                body.append(a_hash[0])
-                # Cycle 3: L-P xors + A.hash[1:3] + B.hash[0]
-                # L-P = 5 xors, a_hash[1], a_hash[2], b_hash[0] = 8 ops → 2 cycles
-                # Let build() pack: [L,M,N xor + a.hash[1], a.hash[2], b.hash[0]] = 6, [O,P xor] = 2
-                body.extend(l_xor)
-                body.extend(m_xor)
-                body.extend(n_xor)
-                body.append(a_hash[1])
-                body.append(a_hash[2])
-                body.append(b_hash[0])
-                # Remaining xors: O, P  (+ continuing hash diagonal)
-                body.extend(o_xor)
-                body.extend(p_xor)
-                # Continue hash+idx diagonal from where we left off (A.hash[3] onward)
-            else:
-                # Xors already applied externally (injected into previous hextet's tail).
-                # Start hash diagonal directly (no xors to emit).
-                body.append(a_hash[0])
-                body.append(a_hash[1])
-                body.append(a_hash[2])
-                body.append(b_hash[0])
-            body.append(a_hash[3])
-            body.append(b_hash[1])
-            body.append(b_hash[2])
-            body.append(c_hash[0])
-
-            # Step 7: A.hash[4] + B.hash[3] + C.hash[1:3] + D.hash[0]
-            body.append(a_hash[4])
-            body.append(b_hash[3])
-            body.append(c_hash[1])
-            body.append(c_hash[2])
-            body.append(d_hash[0])
-
-            # Step 8: A.hash[5:7] + B.hash[4] + C.hash[3] + D.hash[1:3]
-            body.append(a_hash[5])
-            body.append(a_hash[6])
-            body.append(b_hash[4])
-            body.append(c_hash[3])
-            body.append(d_hash[1])
-            body.append(d_hash[2])
-
-            # Step 9: A.hash[7] + B.hash[5:7] + C.hash[4] + D.hash[3]
-            body.append(a_hash[7])
-            body.append(b_hash[5])
-            body.append(b_hash[6])
-            body.append(c_hash[4])
-            body.append(d_hash[3])
-
-            # Step 10: A.hash[8] + B.hash[7] + C.hash[5:7] + D.hash[4]
-            body.append(a_hash[8])
-            body.append(b_hash[7])
-            body.append(c_hash[5])
-            body.append(c_hash[6])
-            body.append(d_hash[4])
-
-            # Step 11: A.hash[9:11] + B.hash[8] + C.hash[7] + D.hash[5:7]
-            body.append(a_hash[9])
-            body.append(a_hash[10])
-            body.append(b_hash[8])
-            body.append(c_hash[7])
-            body.append(d_hash[5])
-            body.append(d_hash[6])
-
-            # Step 12: A.hash[11] + B.hash[9:11] + C.hash[8] + D.hash[7]
-            body.append(a_hash[11])
-            body.append(b_hash[9])
-            body.append(b_hash[10])
-            body.append(c_hash[8])
-            body.append(d_hash[7])
-
-            # Step 13: A.idx[0] + B.hash[11] + C.hash[9:11] + D.hash[8]
-            body.append(a_idx[0])
-            body.append(b_hash[11])
-            body.append(c_hash[9])
-            body.append(c_hash[10])
-            body.append(d_hash[8])
-
-            # Step 14: A.idx[1] + B.idx[0] + C.hash[11] + D.hash[9:11]
-            body.append(a_idx[1])
-            body.append(b_idx[0])
-            body.append(c_hash[11])
-            body.append(d_hash[9])
-            body.append(d_hash[10])
-
-            # Step 15: A.idx[2] + B.idx[1] + C.idx[0] + D.hash[11]
-            body.append(a_idx[2])
-            body.append(b_idx[1])
-            body.append(c_idx[0])
-            body.append(d_hash[11])
-
-            # Step 16: A.idx[3] + B.idx[2] + C.idx[1] + D.idx[0]
-            body.append(a_idx[3])
-            body.append(b_idx[2])
-            body.append(c_idx[1])
-            body.append(d_idx[0])
-
-            # Step 17: A.idx[4] + B.idx[3] + C.idx[2] + D.idx[1]
-            body.append(a_idx[4])
-            body.append(b_idx[3])
-            body.append(c_idx[2])
-            body.append(d_idx[1])
-
-            # Step 18: B.idx[4] + C.idx[3] + D.idx[2]
-            body.append(b_idx[4])
-            body.append(c_idx[3])
-            body.append(d_idx[2])
-
-            # Step 19: C.idx[4] + D.idx[3] + E.hash[0]
-            body.append(c_idx[4])
-            body.append(d_idx[3])
-            body.append(e_hash[0])
-
-            # Step 20: D.idx[4] + E.hash[1:3] + F.hash[0]
-            body.append(d_idx[4])
-            body.append(e_hash[1])
-            body.append(e_hash[2])
-            body.append(f_hash[0])
-
-            # Step 21: E.hash[3] + F.hash[1:3] + G.hash[0]
-            body.append(e_hash[3])
-            body.append(f_hash[1])
-            body.append(f_hash[2])
-            body.append(g_hash[0])
-
-            # Step 22: E.hash[4] + F.hash[3] + G.hash[1:3] + H.hash[0]
-            body.append(e_hash[4])
-            body.append(f_hash[3])
-            body.append(g_hash[1])
-            body.append(g_hash[2])
-            body.append(h_hash[0])
-
-            # Step 23: E.hash[5:7] + F.hash[4] + G.hash[3] + H.hash[1:3]
-            body.append(e_hash[5])
-            body.append(e_hash[6])
-            body.append(f_hash[4])
-            body.append(g_hash[3])
-            body.append(h_hash[1])
-            body.append(h_hash[2])
-
-            # Step 24: E.hash[7] + F.hash[5:7] + G.hash[4] + H.hash[3]
-            body.append(e_hash[7])
-            body.append(f_hash[5])
-            body.append(f_hash[6])
-            body.append(g_hash[4])
-            body.append(h_hash[3])
-
-            # Step 25: E.hash[8] + F.hash[7] + G.hash[5:7] + H.hash[4]
-            body.append(e_hash[8])
-            body.append(f_hash[7])
-            body.append(g_hash[5])
-            body.append(g_hash[6])
-            body.append(h_hash[4])
-
-            # Step 26: E.hash[9:11] + F.hash[8] + G.hash[7] + H.hash[5:7]
-            body.append(e_hash[9])
-            body.append(e_hash[10])
-            body.append(f_hash[8])
-            body.append(g_hash[7])
-            body.append(h_hash[5])
-            body.append(h_hash[6])
-
-            # Step 27: E.hash[11] + F.hash[9:11] + G.hash[8] + H.hash[7]
-            body.append(e_hash[11])
-            body.append(f_hash[9])
-            body.append(f_hash[10])
-            body.append(g_hash[8])
-            body.append(h_hash[7])
-
-            # Step 28: E.idx[0] + F.hash[11] + G.hash[9:11] + H.hash[8]
-            body.append(e_idx[0])
-            body.append(f_hash[11])
-            body.append(g_hash[9])
-            body.append(g_hash[10])
-            body.append(h_hash[8])
-
-            # Step 29: E.idx[1] + F.idx[0] + G.hash[11] + H.hash[9:11]
-            body.append(e_idx[1])
-            body.append(f_idx[0])
-            body.append(g_hash[11])
-            body.append(h_hash[9])
-            body.append(h_hash[10])
-
-            # Step 30: E.idx[2] + F.idx[1] + G.idx[0] + H.hash[11]
-            body.append(e_idx[2])
-            body.append(f_idx[1])
-            body.append(g_idx[0])
-            body.append(h_hash[11])
-
-            # Step 31: E.idx[3] + F.idx[2] + G.idx[1] + H.idx[0]
-            body.append(e_idx[3])
-            body.append(f_idx[2])
-            body.append(g_idx[1])
-            body.append(h_idx[0])
-
-            # Step 32: E.idx[4] + F.idx[3] + G.idx[2] + H.idx[1]
-            body.append(e_idx[4])
-            body.append(f_idx[3])
-            body.append(g_idx[2])
-            body.append(h_idx[1])
-
-            # Step 33: F.idx[4] + G.idx[3] + H.idx[2] + I.hash[0]
-            body.append(f_idx[4])
-            body.append(g_idx[3])
-            body.append(h_idx[2])
-            body.append(i_hash[0])
-
-            # Step 34: G.idx[4] + H.idx[3] + I.hash[1:3] + J.hash[0]
-            body.append(g_idx[4])
-            body.append(h_idx[3])
-            body.append(i_hash[1])
-            body.append(i_hash[2])
-            body.append(j_hash[0])
-
-            # Step 35: H.idx[4] + I.hash[3] + J.hash[1:3] + K.hash[0]
-            body.append(h_idx[4])
-            body.append(i_hash[3])
-            body.append(j_hash[1])
-            body.append(j_hash[2])
-            body.append(k_hash[0])
-
-            # Step 36: I.hash[4] + J.hash[3] + K.hash[1:3] + L.hash[0]
-            body.append(i_hash[4])
-            body.append(j_hash[3])
-            body.append(k_hash[1])
-            body.append(k_hash[2])
-            body.append(l_hash[0])
-
-            # Step 37: I.hash[5:7] + J.hash[4] + K.hash[3] + L.hash[1:3]
-            body.append(i_hash[5])
-            body.append(i_hash[6])
-            body.append(j_hash[4])
-            body.append(k_hash[3])
-            body.append(l_hash[1])
-            body.append(l_hash[2])
-
-            # Step 38: I.hash[7] + J.hash[5:7] + K.hash[4] + L.hash[3]
-            body.append(i_hash[7])
-            body.append(j_hash[5])
-            body.append(j_hash[6])
-            body.append(k_hash[4])
-            body.append(l_hash[3])
-
-            # Step 39: I.hash[8] + J.hash[7] + K.hash[5:7] + L.hash[4] + M.hash[0]
-            body.append(i_hash[8])
-            body.append(j_hash[7])
-            body.append(k_hash[5])
-            body.append(k_hash[6])
-            body.append(l_hash[4])
-            body.append(m_hash[0])
-
-            # Step 40: I.hash[9:11] + J.hash[8] + K.hash[7] + L.hash[5:7]
-            body.append(i_hash[9])
-            body.append(i_hash[10])
-            body.append(j_hash[8])
-            body.append(k_hash[7])
-            body.append(l_hash[5])
-            body.append(l_hash[6])
-
-            # Step 41: I.hash[11] + J.hash[9:11] + K.hash[8] + L.hash[7] + M.hash[1]
-            body.append(i_hash[11])
-            body.append(j_hash[9])
-            body.append(j_hash[10])
-            body.append(k_hash[8])
-            body.append(l_hash[7])
-            body.append(m_hash[1])
-
-            # Step 42: I.idx[0] + J.hash[11] + K.hash[9:11] + L.hash[8] + M.hash[2]
-            body.append(i_idx[0])
-            body.append(j_hash[11])
-            body.append(k_hash[9])
-            body.append(k_hash[10])
-            body.append(l_hash[8])
-            body.append(m_hash[2])
-
-            # Step 43: I.idx[1] + J.idx[0] + K.hash[11] + L.hash[9:11] + M.hash[3]
-            body.append(i_idx[1])
-            body.append(j_idx[0])
-            body.append(k_hash[11])
-            body.append(l_hash[9])
-            body.append(l_hash[10])
-            body.append(m_hash[3])
-
-            # Step 44: I.idx[2] + J.idx[1] + K.idx[0] + L.hash[11] + M.hash[4] + N.hash[0]
-            body.append(i_idx[2])
-            body.append(j_idx[1])
-            body.append(k_idx[0])
-            body.append(l_hash[11])
-            body.append(m_hash[4])
-            body.append(n_hash[0])
-
-            # Step 45: I.idx[3] + J.idx[2] + K.idx[1] + L.idx[0] + M.hash[5:7]
-            body.append(i_idx[3])
-            body.append(j_idx[2])
-            body.append(k_idx[1])
-            body.append(l_idx[0])
-            body.append(m_hash[5])
-            body.append(m_hash[6])
-
-            # Step 46: I.idx[4] + J.idx[3] + K.idx[2] + L.idx[1] + M.hash[7] + N.hash[1]
-            body.append(i_idx[4])
-            body.append(j_idx[3])
-            body.append(k_idx[2])
-            body.append(l_idx[1])
-            body.append(m_hash[7])
-            body.append(n_hash[1])
-
-            # Step 47: J.idx[4] + K.idx[3] + L.idx[2] + M.hash[8] + N.hash[2:4]
-            body.append(j_idx[4])
-            body.append(k_idx[3])
-            body.append(l_idx[2])
-            body.append(m_hash[8])
-            body.append(n_hash[2])
-            body.append(n_hash[3])
-
-            # Step 48: K.idx[4] + L.idx[3] + M.hash[9:11] + N.hash[4] + O.hash[0]
-            body.append(k_idx[4])
-            body.append(l_idx[3])
-            body.append(m_hash[9])
-            body.append(m_hash[10])
-            body.append(n_hash[4])
-            body.append(o_hash[0])
-
-            # Step 49: L.idx[4] + M.hash[11] + N.hash[5:7] + O.hash[1:3]
-            body.append(l_idx[4])
-            body.append(m_hash[11])
-            body.append(n_hash[5])
-            body.append(n_hash[6])
-            body.append(o_hash[1])
-            body.append(o_hash[2])
-
-            # Tail with optional next-round prefetch
-            if next_s is not None:
-                na_addr_nl = next_s['a_addr']; na_loads_nl = next_s['a_loads']
-                nb_addr_nl = next_s['b_addr']; nb_loads_nl = next_s['b_loads']
-                nc_addr_nl = next_s['c_addr']; nc_loads_nl = next_s['c_loads']
-                nd_addr_nl = next_s['d_addr']
-            else:
-                na_addr_nl = nb_addr_nl = nc_addr_nl = nd_addr_nl = []
-                na_loads_nl = nb_loads_nl = nc_loads_nl = []
-
-            # OPTIMIZATION: Emit ALL 4 addr ops first (before step 50 valu ops).
-            body.extend(na_addr_nl)
-            body.extend(nb_addr_nl)
-            body.extend(nc_addr_nl)
-            body.extend(nd_addr_nl)
-
-            # Step 50: M.idx[0] + N.hash[7] + O.hash[3] + P.hash[0]
-            body.append(m_idx[0]); body.append(n_hash[7]); body.append(o_hash[3]); body.append(p_hash[0])
-            # Step 51: M.idx[1] + N.hash[8] + O.hash[4] + P.hash[1:3] [+ na_loads[0:2]]
-            body.append(m_idx[1]); body.append(n_hash[8]); body.append(o_hash[4])
-            body.append(p_hash[1]); body.append(p_hash[2])
-            body.extend(na_loads_nl[0:2])
-            # Step 52: M.idx[2] + N.hash[9:11] + O.hash[5:7] + P.hash[3] [+ na_loads[2:4]]
-            body.append(m_idx[2]); body.append(n_hash[9]); body.append(n_hash[10])
-            body.append(o_hash[5]); body.append(o_hash[6]); body.append(p_hash[3])
-            body.extend(na_loads_nl[2:4])
-            # Step 53: M.idx[3] + N.hash[11] + O.hash[7] + P.hash[4] [+ na_loads[4:6]]
-            body.append(m_idx[3]); body.append(n_hash[11]); body.append(o_hash[7]); body.append(p_hash[4])
-            body.extend(na_loads_nl[4:6])
-            # Step 54: M.idx[4] + N.idx[0] + O.hash[8] + P.hash[5:7] [+ na_loads[6:8]]
-            body.append(m_idx[4]); body.append(n_idx[0]); body.append(o_hash[8])
-            body.append(p_hash[5]); body.append(p_hash[6]); body.extend(na_loads_nl[6:8])
-            # Step 55: N.idx[1] + O.hash[9:11] + P.hash[7] [+ nb_loads[0:2]]
-            body.append(n_idx[1]); body.append(o_hash[9]); body.append(o_hash[10]); body.append(p_hash[7])
-            body.extend(nb_loads_nl[0:2])
-            # Step 56: N.idx[2] + O.hash[11] + P.hash[8] [+ nb_loads[2:4]]
-            body.append(n_idx[2]); body.append(o_hash[11]); body.append(p_hash[8])
-            body.extend(nb_loads_nl[2:4])
-            # Step 57: N.idx[3] + O.idx[0] + P.hash[9:11] [+ nb_loads[4:6]]
-            body.append(n_idx[3]); body.append(o_idx[0]); body.append(p_hash[9]); body.append(p_hash[10])
-            body.extend(nb_loads_nl[4:6])
-            # Step 58: N.idx[4] + O.idx[1] + P.hash[11] [+ nb_loads[6:8]]
-            body.append(n_idx[4]); body.append(o_idx[1]); body.append(p_hash[11])
-            body.extend(nb_loads_nl[6:8])
-            # Steps 59-63: tail with free valu slots for xor injection.
-            # Each step has only 2 (or 1) valu ops, leaving 4 (or 5) free valu slots.
-            # tail_inject_xors (if provided) is a list of up to 16 single-tuple valu slots
-            # to inject here (16 groups x 1 xor each for next hextet).
-            ix = list(tail_inject_xors) if tail_inject_xors is not None else []
-            # Step 59: O.idx[2] + P.idx[0] [+ nc_loads[0:2]] [+ inject[0:4]]
-            body.append(o_idx[2]); body.append(p_idx[0]); body.extend(nc_loads_nl[0:2])
-            body.extend(ix[0:4])
-            # Step 60: O.idx[3] + P.idx[1] [+ nc_loads[2:4]] [+ inject[4:8]]
-            body.append(o_idx[3]); body.append(p_idx[1]); body.extend(nc_loads_nl[2:4])
-            body.extend(ix[4:8])
-            # Step 61: O.idx[4] + P.idx[2] [+ nc_loads[4:6]] [+ inject[8:12]]
-            body.append(o_idx[4]); body.append(p_idx[2]); body.extend(nc_loads_nl[4:6])
-            body.extend(ix[8:12])
-            # Step 62: P.idx[3] [+ nc_loads[6:8]] [+ inject[12:16]]
-            body.append(p_idx[3]); body.extend(nc_loads_nl[6:8])
-            body.extend(ix[12:16])
-            # Step 63: P.idx[4] (nd_addr already emitted at front of tail)
-            body.append(p_idx[4])
+                for xv in [a_xor, b_xor, c_xor, d_xor, e_xor, f_xor]:
+                    body.extend(xv)
+                for xv in [g_xor, h_xor, i_xor, j_xor, k_xor, l_xor]:
+                    body.extend(xv)
+                for xv in [m_xor, n_xor, o_xor, p_xor]:
+                    body.extend(xv)
+            emit_octet_hash_idx_parallel(body, [gA,gB,gC,gD,gE,gF,gG,gH], [pA,pB,pC,pD,pE,pF,pG,pH])
+            emit_octet_hash_idx_parallel(body, [gI,gJ,gK,gL,gM,gN,gO,gP], [pI,pJ,pK,pL,pM,pN,pO,pP])
+            if tail_inject_xors is not None:
+                for xop in tail_inject_xors: body.append(xop)
 
         # --- No-load hextet with arithmetic vselect for round_mod==1 ---
         def emit_hextet_vselect2(body, grp_start, nv_bcast1, nv_bcast2, diff_vec):
@@ -1043,9 +712,9 @@ class KernelBuilder:
             gI, gJ, gK, gL = grp_start+8, grp_start+9, grp_start+10, grp_start+11
             gM, gN, gO, gP = grp_start+12, grp_start+13, grp_start+14, grp_start+15
             pA, pB, pC, pD = 0, 1, 2, 3
-            pE, pF, pG, pH = 0, 1, 2, 3
+            pE, pF, pG, pH = 4, 5, 6, 7  # 012a: use extended pairs
             pI, pJ, pK, pL = 0, 1, 2, 3
-            pM, pN, pO, pP = 0, 1, 2, 3
+            pM, pN, pO, pP = 4, 5, 6, 7  # 012a: use extended pairs
 
             # Per-group arithmetic select slots (2 valu ops each):
             # Step 1: lsb_g = idx_g & 1 → addr_tmp_g[g]
@@ -1128,279 +797,9 @@ class KernelBuilder:
             for g in [gA, gB, gC, gD, gE, gF, gG, gH, gI, gJ, gK, gL, gM, gN, gO, gP]:
                 body.append(("valu", ("^", val_base + g * VLEN, val_base + g * VLEN, nv_tmp_g[g])))
 
-            # Hash+idx in normal diagonal order (same as emit_hextet_noload but without xors)
-            body.append(a_hash[0])
-            body.append(a_hash[1])
-            body.append(a_hash[2])
-            body.append(b_hash[0])
-            body.append(a_hash[3])
-            body.append(b_hash[1])
-            body.append(b_hash[2])
-            body.append(c_hash[0])
-            body.append(a_hash[4])
-            body.append(b_hash[3])
-            body.append(c_hash[1])
-            body.append(c_hash[2])
-            body.append(d_hash[0])
-            body.append(a_hash[5])
-            body.append(a_hash[6])
-            body.append(b_hash[4])
-            body.append(c_hash[3])
-            body.append(d_hash[1])
-            body.append(d_hash[2])
-            body.append(a_hash[7])
-            body.append(b_hash[5])
-            body.append(b_hash[6])
-            body.append(c_hash[4])
-            body.append(d_hash[3])
-            body.append(a_hash[8])
-            body.append(b_hash[7])
-            body.append(c_hash[5])
-            body.append(c_hash[6])
-            body.append(d_hash[4])
-            body.append(a_hash[9])
-            body.append(a_hash[10])
-            body.append(b_hash[8])
-            body.append(c_hash[7])
-            body.append(d_hash[5])
-            body.append(d_hash[6])
-            body.append(a_hash[11])
-            body.append(b_hash[9])
-            body.append(b_hash[10])
-            body.append(c_hash[8])
-            body.append(d_hash[7])
-            body.append(a_idx[0])
-            body.append(b_hash[11])
-            body.append(c_hash[9])
-            body.append(c_hash[10])
-            body.append(d_hash[8])
-            body.append(a_idx[1])
-            body.append(b_idx[0])
-            body.append(c_hash[11])
-            body.append(d_hash[9])
-            body.append(d_hash[10])
-            body.append(a_idx[2])
-            body.append(b_idx[1])
-            body.append(c_idx[0])
-            body.append(d_hash[11])
-            body.append(a_idx[3])
-            body.append(b_idx[2])
-            body.append(c_idx[1])
-            body.append(d_idx[0])
-            body.append(a_idx[4])
-            body.append(b_idx[3])
-            body.append(c_idx[2])
-            body.append(d_idx[1])
-            body.append(b_idx[4])
-            body.append(c_idx[3])
-            body.append(d_idx[2])
-            body.append(c_idx[4])
-            body.append(d_idx[3])
-            body.append(e_hash[0])
-            body.append(d_idx[4])
-            body.append(e_hash[1])
-            body.append(e_hash[2])
-            body.append(f_hash[0])
-            body.append(e_hash[3])
-            body.append(f_hash[1])
-            body.append(f_hash[2])
-            body.append(g_hash[0])
-            body.append(e_hash[4])
-            body.append(f_hash[3])
-            body.append(g_hash[1])
-            body.append(g_hash[2])
-            body.append(h_hash[0])
-            body.append(e_hash[5])
-            body.append(e_hash[6])
-            body.append(f_hash[4])
-            body.append(g_hash[3])
-            body.append(h_hash[1])
-            body.append(h_hash[2])
-            body.append(e_hash[7])
-            body.append(f_hash[5])
-            body.append(f_hash[6])
-            body.append(g_hash[4])
-            body.append(h_hash[3])
-            body.append(e_hash[8])
-            body.append(f_hash[7])
-            body.append(g_hash[5])
-            body.append(g_hash[6])
-            body.append(h_hash[4])
-            body.append(e_hash[9])
-            body.append(e_hash[10])
-            body.append(f_hash[8])
-            body.append(g_hash[7])
-            body.append(h_hash[5])
-            body.append(h_hash[6])
-            body.append(e_hash[11])
-            body.append(f_hash[9])
-            body.append(f_hash[10])
-            body.append(g_hash[8])
-            body.append(h_hash[7])
-            body.append(e_idx[0])
-            body.append(f_hash[11])
-            body.append(g_hash[9])
-            body.append(g_hash[10])
-            body.append(h_hash[8])
-            body.append(e_idx[1])
-            body.append(f_idx[0])
-            body.append(g_hash[11])
-            body.append(h_hash[9])
-            body.append(h_hash[10])
-            body.append(e_idx[2])
-            body.append(f_idx[1])
-            body.append(g_idx[0])
-            body.append(h_hash[11])
-            body.append(e_idx[3])
-            body.append(f_idx[2])
-            body.append(g_idx[1])
-            body.append(h_idx[0])
-            body.append(e_idx[4])
-            body.append(f_idx[3])
-            body.append(g_idx[2])
-            body.append(h_idx[1])
-            body.append(f_idx[4])
-            body.append(g_idx[3])
-            body.append(h_idx[2])
-            body.append(i_hash[0])
-            body.append(g_idx[4])
-            body.append(h_idx[3])
-            body.append(i_hash[1])
-            body.append(i_hash[2])
-            body.append(j_hash[0])
-            body.append(h_idx[4])
-            body.append(i_hash[3])
-            body.append(j_hash[1])
-            body.append(j_hash[2])
-            body.append(k_hash[0])
-            body.append(i_hash[4])
-            body.append(j_hash[3])
-            body.append(k_hash[1])
-            body.append(k_hash[2])
-            body.append(l_hash[0])
-            body.append(i_hash[5])
-            body.append(i_hash[6])
-            body.append(j_hash[4])
-            body.append(k_hash[3])
-            body.append(l_hash[1])
-            body.append(l_hash[2])
-            body.append(i_hash[7])
-            body.append(j_hash[5])
-            body.append(j_hash[6])
-            body.append(k_hash[4])
-            body.append(l_hash[3])
-            body.append(i_hash[8])
-            body.append(j_hash[7])
-            body.append(k_hash[5])
-            body.append(k_hash[6])
-            body.append(l_hash[4])
-            body.append(m_hash[0])
-            body.append(i_hash[9])
-            body.append(i_hash[10])
-            body.append(j_hash[8])
-            body.append(k_hash[7])
-            body.append(l_hash[5])
-            body.append(l_hash[6])
-            body.append(i_hash[11])
-            body.append(j_hash[9])
-            body.append(j_hash[10])
-            body.append(k_hash[8])
-            body.append(l_hash[7])
-            body.append(m_hash[1])
-            body.append(i_idx[0])
-            body.append(j_hash[11])
-            body.append(k_hash[9])
-            body.append(k_hash[10])
-            body.append(l_hash[8])
-            body.append(m_hash[2])
-            body.append(i_idx[1])
-            body.append(j_idx[0])
-            body.append(k_hash[11])
-            body.append(l_hash[9])
-            body.append(l_hash[10])
-            body.append(m_hash[3])
-            body.append(i_idx[2])
-            body.append(j_idx[1])
-            body.append(k_idx[0])
-            body.append(l_hash[11])
-            body.append(m_hash[4])
-            body.append(n_hash[0])
-            body.append(i_idx[3])
-            body.append(j_idx[2])
-            body.append(k_idx[1])
-            body.append(l_idx[0])
-            body.append(m_hash[5])
-            body.append(m_hash[6])
-            body.append(i_idx[4])
-            body.append(j_idx[3])
-            body.append(k_idx[2])
-            body.append(l_idx[1])
-            body.append(m_hash[7])
-            body.append(n_hash[1])
-            body.append(j_idx[4])
-            body.append(k_idx[3])
-            body.append(l_idx[2])
-            body.append(m_hash[8])
-            body.append(n_hash[2])
-            body.append(n_hash[3])
-            body.append(k_idx[4])
-            body.append(l_idx[3])
-            body.append(m_hash[9])
-            body.append(m_hash[10])
-            body.append(n_hash[4])
-            body.append(o_hash[0])
-            body.append(l_idx[4])
-            body.append(m_hash[11])
-            body.append(n_hash[5])
-            body.append(n_hash[6])
-            body.append(o_hash[1])
-            body.append(o_hash[2])
-            body.append(m_idx[0])
-            body.append(n_hash[7])
-            body.append(o_hash[3])
-            body.append(p_hash[0])
-            body.append(m_idx[1])
-            body.append(n_hash[8])
-            body.append(o_hash[4])
-            body.append(p_hash[1])
-            body.append(p_hash[2])
-            body.append(m_idx[2])
-            body.append(n_hash[9])
-            body.append(n_hash[10])
-            body.append(o_hash[5])
-            body.append(o_hash[6])
-            body.append(p_hash[3])
-            body.append(m_idx[3])
-            body.append(n_hash[11])
-            body.append(o_hash[7])
-            body.append(p_hash[4])
-            body.append(m_idx[4])
-            body.append(n_idx[0])
-            body.append(o_hash[8])
-            body.append(p_hash[5])
-            body.append(p_hash[6])
-            body.append(n_idx[1])
-            body.append(o_hash[9])
-            body.append(o_hash[10])
-            body.append(p_hash[7])
-            body.append(n_idx[2])
-            body.append(o_hash[11])
-            body.append(p_hash[8])
-            body.append(n_idx[3])
-            body.append(o_idx[0])
-            body.append(p_hash[9])
-            body.append(p_hash[10])
-            body.append(n_idx[4])
-            body.append(o_idx[1])
-            body.append(p_hash[11])
-            body.append(o_idx[2])
-            body.append(p_idx[0])
-            body.append(o_idx[3])
-            body.append(p_idx[1])
-            body.append(o_idx[4])
-            body.append(p_idx[2])
-            body.append(p_idx[3])
-            body.append(p_idx[4])
+            # 012a: Replaced hand-coded diagonal with parallel-octet approach.
+            emit_octet_hash_idx_parallel(body, [gA,gB,gC,gD,gE,gF,gG,gH], [pA,pB,pC,pD,pE,pF,pG,pH])
+            emit_octet_hash_idx_parallel(body, [gI,gJ,gK,gL,gM,gN,gO,gP], [pI,pJ,pK,pL,pM,pN,pO,pP])
 
         # --- No-load hextet with 4-node arithmetic select for round_mod==2 ---
         def emit_hextet_arith4(body, grp_start, node3_b, node5_b, diff34_b, diff56_b, next_s=None):
@@ -1429,20 +828,21 @@ class KernelBuilder:
             gI, gJ, gK, gL = grp_start+8, grp_start+9, grp_start+10, grp_start+11
             gM, gN, gO, gP = grp_start+12, grp_start+13, grp_start+14, grp_start+15
             pA, pB, pC, pD = 0, 1, 2, 3
-            pE, pF, pG, pH = 0, 1, 2, 3
+            # 012a: EFGH use pairs 4-7, MNOP use pairs 4-7 in hash (same as normal hextet)
+            pE, pF, pG, pH = 4, 5, 6, 7
             pI, pJ, pK, pL = 0, 1, 2, 3
-            pM, pN, pO, pP = 0, 1, 2, 3
+            pM, pN, pO, pP = 4, 5, 6, 7
 
-            # Per-group arithmetic 4-node select slots
-            # Uses pair-indexed scratch (t1,t2,lsb,cmp) + per-group scratch (addr_tmp_g)
+            # Per-group arithmetic 4-node select slots (012a: parallel-safe version)
+            # Uses t1/t2 pairs and per-group nv_tmp for bit0/bit1 (no pair aliasing).
             def arith4_nv_slots(g, p):
                 idx_s = idx_base + g * VLEN
                 val_s = val_base + g * VLEN
-                sub_s = addr_tmp_g[g]       # per-group, no sharing
-                bit0_s = lsb_tmp_pair[p]    # pair-indexed
-                bit1_s = cmp_tmp_pair[p]    # pair-indexed
-                lo_s = t1_tmp_pair[p]       # pair-indexed
-                hi_s = t2_tmp_pair[p]       # pair-indexed
+                sub_s = addr_tmp_g[g]                       # per-group, no sharing
+                bit0_s = nv_tmp_g[g]                        # per-group bit0 scratch
+                bit1_s = nv_tmp_g[(g + 16) % n_groups]     # per-group bit1 scratch (mirrored)
+                lo_s = t1_tmp_pair[p]                       # pair-indexed (hash reuse)
+                hi_s = t2_tmp_pair[p]                       # pair-indexed (hash reuse)
                 return [
                     ("valu", ("-", sub_s, idx_s, three_vec)),
                     ("valu", ("&", bit0_s, sub_s, one_vec)),
@@ -1571,368 +971,43 @@ class KernelBuilder:
             # At step 2 (bit0): A writes lsb_pair[0], E writes lsb_pair[0] → WAW conflict → separate cycles.
             # So A.step2 goes first, E.step2 follows next available cycle. This is safe and automatic.
 
-            # Emit arith4_nv in QUARTET ORDER to ensure pair-reuse safety.
-            # CRITICAL: Groups A,E,I,M all share pair 0. If E.bit0 (writes lsb_pair[0]) is
-            # emitted before A.lo (reads lsb_pair[0]), the packer may schedule E.bit0 first,
-            # causing A.lo to read E's lsb instead of A's. Fix: emit complete quartet
-            # (ABCD steps 0-7) before starting EFGH, which ensures A.lo comes before E.bit0.
-            # Within a quartet, ABCD use different pairs (0,1,2,3), so all 4 can interleave.
-            quartets = [
-                [(gA,pA), (gB,pB), (gC,pC), (gD,pD)],
-                [(gE,pE), (gF,pF), (gG,pG), (gH,pH)],
-                [(gI,pI), (gJ,pJ), (gK,pK), (gL,pL)],
-                [(gM,pM), (gN,pN), (gO,pO), (gP,pP)],
+            # 012a: Emit arith4_nv in OCTET ORDER for parallel processing.
+            # With nv_tmp_g as per-group bit0/bit1 scratch (no pair aliasing),
+            # ABCD+EFGH can process NV simultaneously (different bit0/bit1/lo/hi scratch).
+            octets_nv = [
+                [(gA,pA), (gB,pB), (gC,pC), (gD,pD), (gE,pE), (gF,pF), (gG,pG), (gH,pH)],
+                [(gI,pI), (gJ,pJ), (gK,pK), (gL,pL), (gM,pM), (gN,pN), (gO,pO), (gP,pP)],
             ]
-            for quartet in quartets:
-                # Emit all 8 steps for this quartet in step order.
-                # Within each step, emit all 4 groups (different pairs → parallelism).
-                # Step 0: sub (writes addr_tmp_g[g], no pair scratch)
-                for g, p in quartet:
+            for octet_nv in octets_nv:
+                # Step 0: sub for all 8 groups (independent addr_tmp_g → 2 bundles)
+                for g, p in octet_nv:
+                    body.append(arith4_nv_slots(g, p)[0])
+                # Step 1+2: bit0 and bit1 (per-group nv_tmp scratch → no WAW conflicts → 3 bundles)
+                for g, p in octet_nv:
                     a4 = arith4_nv_slots(g, p)
-                    body.append(a4[0])
-                # Step 1+2: bit0 and bit1 (write lsb_pair[p] and cmp_pair[p])
-                for g, p in quartet:
+                    body.append(a4[1])
+                    body.append(a4[2])
+                # Step 3+4: lo and hi (read bit0, write t1/t2 → ABCD:t1[0-3] EFGH:t1[4-7] → 3 bundles)
+                for g, p in octet_nv:
                     a4 = arith4_nv_slots(g, p)
-                    body.append(a4[1])  # bit0
-                    body.append(a4[2])  # bit1
-                # Step 3+4: lo and hi (read lsb_pair[p], write t1_pair[p] and t2_pair[p])
-                for g, p in quartet:
-                    a4 = arith4_nv_slots(g, p)
-                    body.append(a4[3])  # lo
-                    body.append(a4[4])  # hi
-                # Step 5: diff_lohi (read t1+t2 pair, write addr_tmp_g[g])
-                for g, p in quartet:
-                    a4 = arith4_nv_slots(g, p)
-                    body.append(a4[5])  # diff_lohi
-                # Step 6: nv (read cmp_pair[p], addr_tmp_g[g], t1_pair[p], write t1_pair[p])
-                for g, p in quartet:
-                    a4 = arith4_nv_slots(g, p)
-                    body.append(a4[6])  # nv
-                # Step 7: val ^= nv (read t1_pair[p], write val_s)
-                for g, p in quartet:
-                    a4 = arith4_nv_slots(g, p)
-                    body.append(a4[7])  # val ^= nv
+                    body.append(a4[3])
+                    body.append(a4[4])
+                # Step 5: diff_lohi (8 ops → 2 bundles)
+                for g, p in octet_nv:
+                    body.append(arith4_nv_slots(g, p)[5])
+                # Step 6: nv (8 ops → 2 bundles)
+                for g, p in octet_nv:
+                    body.append(arith4_nv_slots(g, p)[6])
+                # Step 7: val ^= nv (8 ops → 2 bundles)
+                for g, p in octet_nv:
+                    body.append(arith4_nv_slots(g, p)[7])
 
-            # Hash+idx diagonal (same as emit_hextet_noload)
-            body.append(a_hash[0])
-
-            body.append(a_hash[1])
-            body.append(a_hash[2])
-            body.append(b_hash[0])
-
-            body.append(a_hash[3])
-            body.append(b_hash[1])
-            body.append(b_hash[2])
-            body.append(c_hash[0])
-
-            body.append(a_hash[4])
-            body.append(b_hash[3])
-            body.append(c_hash[1])
-            body.append(c_hash[2])
-            body.append(d_hash[0])
-
-            body.append(a_hash[5])
-            body.append(a_hash[6])
-            body.append(b_hash[4])
-            body.append(c_hash[3])
-            body.append(d_hash[1])
-            body.append(d_hash[2])
-
-            body.append(a_hash[7])
-            body.append(b_hash[5])
-            body.append(b_hash[6])
-            body.append(c_hash[4])
-            body.append(d_hash[3])
-
-            body.append(a_hash[8])
-            body.append(b_hash[7])
-            body.append(c_hash[5])
-            body.append(c_hash[6])
-            body.append(d_hash[4])
-
-            body.append(a_hash[9])
-            body.append(a_hash[10])
-            body.append(b_hash[8])
-            body.append(c_hash[7])
-            body.append(d_hash[5])
-            body.append(d_hash[6])
-
-            body.append(a_hash[11])
-            body.append(b_hash[9])
-            body.append(b_hash[10])
-            body.append(c_hash[8])
-            body.append(d_hash[7])
-
-            body.append(a_idx[0])
-            body.append(b_hash[11])
-            body.append(c_hash[9])
-            body.append(c_hash[10])
-            body.append(d_hash[8])
-
-            body.append(a_idx[1])
-            body.append(b_idx[0])
-            body.append(c_hash[11])
-            body.append(d_hash[9])
-            body.append(d_hash[10])
-
-            body.append(a_idx[2])
-            body.append(b_idx[1])
-            body.append(c_idx[0])
-            body.append(d_hash[11])
-
-            body.append(a_idx[3])
-            body.append(b_idx[2])
-            body.append(c_idx[1])
-            body.append(d_idx[0])
-
-            body.append(a_idx[4])
-            body.append(b_idx[3])
-            body.append(c_idx[2])
-            body.append(d_idx[1])
-
-            body.append(b_idx[4])
-            body.append(c_idx[3])
-            body.append(d_idx[2])
-
-            body.append(c_idx[4])
-            body.append(d_idx[3])
-            body.append(e_hash[0])
-
-            body.append(d_idx[4])
-            body.append(e_hash[1])
-            body.append(e_hash[2])
-            body.append(f_hash[0])
-
-            body.append(e_hash[3])
-            body.append(f_hash[1])
-            body.append(f_hash[2])
-            body.append(g_hash[0])
-
-            body.append(e_hash[4])
-            body.append(f_hash[3])
-            body.append(g_hash[1])
-            body.append(g_hash[2])
-            body.append(h_hash[0])
-
-            body.append(e_hash[5])
-            body.append(e_hash[6])
-            body.append(f_hash[4])
-            body.append(g_hash[3])
-            body.append(h_hash[1])
-            body.append(h_hash[2])
-
-            body.append(e_hash[7])
-            body.append(f_hash[5])
-            body.append(f_hash[6])
-            body.append(g_hash[4])
-            body.append(h_hash[3])
-
-            body.append(e_hash[8])
-            body.append(f_hash[7])
-            body.append(g_hash[5])
-            body.append(g_hash[6])
-            body.append(h_hash[4])
-
-            body.append(e_hash[9])
-            body.append(e_hash[10])
-            body.append(f_hash[8])
-            body.append(g_hash[7])
-            body.append(h_hash[5])
-            body.append(h_hash[6])
-
-            body.append(e_hash[11])
-            body.append(f_hash[9])
-            body.append(f_hash[10])
-            body.append(g_hash[8])
-            body.append(h_hash[7])
-
-            body.append(e_idx[0])
-            body.append(f_hash[11])
-            body.append(g_hash[9])
-            body.append(g_hash[10])
-            body.append(h_hash[8])
-
-            body.append(e_idx[1])
-            body.append(f_idx[0])
-            body.append(g_hash[11])
-            body.append(h_hash[9])
-            body.append(h_hash[10])
-
-            body.append(e_idx[2])
-            body.append(f_idx[1])
-            body.append(g_idx[0])
-            body.append(h_hash[11])
-
-            body.append(e_idx[3])
-            body.append(f_idx[2])
-            body.append(g_idx[1])
-            body.append(h_idx[0])
-
-            body.append(e_idx[4])
-            body.append(f_idx[3])
-            body.append(g_idx[2])
-            body.append(h_idx[1])
-
-            body.append(f_idx[4])
-            body.append(g_idx[3])
-            body.append(h_idx[2])
-            body.append(i_hash[0])
-
-            body.append(g_idx[4])
-            body.append(h_idx[3])
-            body.append(i_hash[1])
-            body.append(i_hash[2])
-            body.append(j_hash[0])
-
-            body.append(h_idx[4])
-            body.append(i_hash[3])
-            body.append(j_hash[1])
-            body.append(j_hash[2])
-            body.append(k_hash[0])
-
-            body.append(i_hash[4])
-            body.append(j_hash[3])
-            body.append(k_hash[1])
-            body.append(k_hash[2])
-            body.append(l_hash[0])
-
-            body.append(i_hash[5])
-            body.append(i_hash[6])
-            body.append(j_hash[4])
-            body.append(k_hash[3])
-            body.append(l_hash[1])
-            body.append(l_hash[2])
-
-            body.append(i_hash[7])
-            body.append(j_hash[5])
-            body.append(j_hash[6])
-            body.append(k_hash[4])
-            body.append(l_hash[3])
-
-            body.append(i_hash[8])
-            body.append(j_hash[7])
-            body.append(k_hash[5])
-            body.append(k_hash[6])
-            body.append(l_hash[4])
-            body.append(m_hash[0])
-
-            body.append(i_hash[9])
-            body.append(i_hash[10])
-            body.append(j_hash[8])
-            body.append(k_hash[7])
-            body.append(l_hash[5])
-            body.append(l_hash[6])
-
-            body.append(i_hash[11])
-            body.append(j_hash[9])
-            body.append(j_hash[10])
-            body.append(k_hash[8])
-            body.append(l_hash[7])
-            body.append(m_hash[1])
-
-            body.append(i_idx[0])
-            body.append(j_hash[11])
-            body.append(k_hash[9])
-            body.append(k_hash[10])
-            body.append(l_hash[8])
-            body.append(m_hash[2])
-
-            body.append(i_idx[1])
-            body.append(j_idx[0])
-            body.append(k_hash[11])
-            body.append(l_hash[9])
-            body.append(l_hash[10])
-            body.append(m_hash[3])
-
-            body.append(i_idx[2])
-            body.append(j_idx[1])
-            body.append(k_idx[0])
-            body.append(l_hash[11])
-            body.append(m_hash[4])
-            body.append(n_hash[0])
-
-            body.append(i_idx[3])
-            body.append(j_idx[2])
-            body.append(k_idx[1])
-            body.append(l_idx[0])
-            body.append(m_hash[5])
-            body.append(m_hash[6])
-
-            body.append(i_idx[4])
-            body.append(j_idx[3])
-            body.append(k_idx[2])
-            body.append(l_idx[1])
-            body.append(m_hash[7])
-            body.append(n_hash[1])
-
-            body.append(j_idx[4])
-            body.append(k_idx[3])
-            body.append(l_idx[2])
-            body.append(m_hash[8])
-            body.append(n_hash[2])
-            body.append(n_hash[3])
-
-            body.append(k_idx[4])
-            body.append(l_idx[3])
-            body.append(m_hash[9])
-            body.append(m_hash[10])
-            body.append(n_hash[4])
-            body.append(o_hash[0])
-
-            body.append(l_idx[4])
-            body.append(m_hash[11])
-            body.append(n_hash[5])
-            body.append(n_hash[6])
-            body.append(o_hash[1])
-            body.append(o_hash[2])
-
-            # Tail (step 50+): same as normal hextet, with optional next_s prefetch
-            # Prepare next-round A+B+C+D head slots (if overlapping)
+            # 012a: Replaced diagonal+tail with parallel-octet approach.
+            emit_octet_hash_idx_parallel(body, [gA,gB,gC,gD,gE,gF,gG,gH], [pA,pB,pC,pD,pE,pF,pG,pH])
+            emit_octet_hash_idx_parallel(body, [gI,gJ,gK,gL,gM,gN,gO,gP], [pI,pJ,pK,pL,pM,pN,pO,pP])
             if next_s is not None:
-                na_addr_t = next_s['a_addr']
-                na_loads_t = next_s['a_loads']
-                nb_addr_t = next_s['b_addr']
-                nb_loads_t = next_s['b_loads']
-                nc_addr_t = next_s['c_addr']
-                nc_loads_t = next_s['c_loads']
-                nd_addr_t = next_s['d_addr']
-            else:
-                na_addr_t = nb_addr_t = nc_addr_t = nd_addr_t = []
-                na_loads_t = nb_loads_t = nc_loads_t = []
-
-            # OPTIMIZATION: Emit ALL 4 addr ops first (before step 50 valu ops).
-            # Same as normal hextet tail optimization: ensures addrs pack in first tail bundle,
-            # enabling loads to start ~12 cycles earlier.
-            body.extend(na_addr_t)
-            body.extend(nb_addr_t)
-            body.extend(nc_addr_t)
-            body.extend(nd_addr_t)
-
-            body.append(m_idx[0]); body.append(n_hash[7]); body.append(o_hash[3]); body.append(p_hash[0])
-            body.append(m_idx[1]); body.append(n_hash[8]); body.append(o_hash[4])
-            body.append(p_hash[1]); body.append(p_hash[2])
-            body.extend(na_loads_t[0:2])
-            body.append(m_idx[2]); body.append(n_hash[9]); body.append(n_hash[10])
-            body.append(o_hash[5]); body.append(o_hash[6]); body.append(p_hash[3])
-            body.extend(na_loads_t[2:4])
-            body.append(m_idx[3]); body.append(n_hash[11]); body.append(o_hash[7]); body.append(p_hash[4])
-            body.extend(na_loads_t[4:6])
-            body.append(m_idx[4]); body.append(n_idx[0]); body.append(o_hash[8])
-            body.append(p_hash[5]); body.append(p_hash[6])
-            body.extend(na_loads_t[6:8])
-            body.append(n_idx[1]); body.append(o_hash[9]); body.append(o_hash[10]); body.append(p_hash[7])
-            body.extend(nb_loads_t[0:2])
-            body.append(n_idx[2]); body.append(o_hash[11]); body.append(p_hash[8])
-            body.extend(nb_loads_t[2:4])
-            body.append(n_idx[3]); body.append(o_idx[0]); body.append(p_hash[9]); body.append(p_hash[10])
-            body.extend(nb_loads_t[4:6])
-            body.append(n_idx[4]); body.append(o_idx[1]); body.append(p_hash[11])
-            body.extend(nb_loads_t[6:8])
-            body.append(o_idx[2]); body.append(p_idx[0]); body.extend(nc_loads_t[0:2])
-            body.append(o_idx[3]); body.append(p_idx[1]); body.extend(nc_loads_t[2:4])
-            body.append(o_idx[4]); body.append(p_idx[2]); body.extend(nc_loads_t[4:6])
-            body.append(p_idx[3]); body.extend(nc_loads_t[6:8])
-            body.append(p_idx[4])
+                for s in next_s['a_addr']+next_s['b_addr']+next_s['c_addr']+next_s['d_addr']: body.append(s)
+                for s in next_s['a_loads']+next_s['b_loads']+next_s['c_loads']: body.append(s)
 
         # --- Main computation loop (fully unrolled, 16-group cross-pipeline) ---
         # 16-group hextet pipeline: A-P groups all interleaved.
@@ -1996,11 +1071,12 @@ class KernelBuilder:
                 # Then load from those addresses.
                 # But add_imm writes to a scalar scratch location. We need temp scalars.
                 # We'll use nv_node1_r1 and nv_node2_r1 as temp address holders.
+                # Use alu + instead of flow add_imm (alu has 12 slots/cycle → both ops in 1 bundle)
                 setup_slots = [
                     # Compute address forest_values_p+1 into nv_node1_r1
-                    ("flow", ("add_imm", nv_node1_r1, sc_forest_values_p, 1)),
+                    ("alu", ("+", nv_node1_r1, sc_forest_values_p, one_scalar)),
                     # Compute address forest_values_p+2 into nv_node2_r1
-                    ("flow", ("add_imm", nv_node2_r1, sc_forest_values_p, 2)),
+                    ("alu", ("+", nv_node2_r1, sc_forest_values_p, two_scalar)),
                 ]
                 setup_instrs1 = self.build(setup_slots)
                 for instr in setup_instrs1:
@@ -2043,36 +1119,31 @@ class KernelBuilder:
                 # Load nodes 3,4,5,6 from forest_values.
                 # Use add_imm to compute addresses forest_values_p+3..+6.
                 # Re-use nv_nodeX_r2 scratch as temp address holders.
+                # Use alu + instead of flow add_imm (all 4 ops can pack in 1 alu bundle)
                 setup_addr_slots = [
-                    ("flow", ("add_imm", nv_node3_r2, sc_forest_values_p, 3)),
-                    ("flow", ("add_imm", nv_node4_r2, sc_forest_values_p, 4)),
+                    ("alu", ("+", nv_node3_r2, sc_forest_values_p, three_scalar)),
+                    ("alu", ("+", nv_node4_r2, sc_forest_values_p, four_scalar)),
+                    ("alu", ("+", nv_node5_r2, sc_forest_values_p, five_scalar)),
+                    ("alu", ("+", nv_node6_r2, sc_forest_values_p, six_scalar)),
                 ]
-                setup_addr_slots2 = [
-                    ("flow", ("add_imm", nv_node5_r2, sc_forest_values_p, 5)),
-                    ("flow", ("add_imm", nv_node6_r2, sc_forest_values_p, 6)),
-                ]
-                for si in [setup_addr_slots, setup_addr_slots2]:
-                    si_instrs = self.build(si)
-                    for instr in si_instrs:
-                        for e, slist in instr.items():
-                            for s in slist:
-                                body.append((e, s))
+                si_instrs = self.build(setup_addr_slots)
+                for instr in si_instrs:
+                    for e, slist in instr.items():
+                        for s in slist:
+                            body.append((e, s))
 
-                # Load node values
+                # Load node values (all 4 can pack: 2 load slots/cycle → 2 bundles)
                 load_slots = [
                     ("load", ("load", nv_node3_r2, nv_node3_r2)),
                     ("load", ("load", nv_node4_r2, nv_node4_r2)),
-                ]
-                load_slots2 = [
                     ("load", ("load", nv_node5_r2, nv_node5_r2)),
                     ("load", ("load", nv_node6_r2, nv_node6_r2)),
                 ]
-                for ls in [load_slots, load_slots2]:
-                    ls_instrs = self.build(ls)
-                    for instr in ls_instrs:
-                        for e, slist in instr.items():
-                            for s in slist:
-                                body.append((e, s))
+                ls_instrs = self.build(load_slots)
+                for instr in ls_instrs:
+                    for e, slist in instr.items():
+                        for s in slist:
+                            body.append((e, s))
 
                 # Broadcast node3 and node5
                 bcast_slots_r2a = [
@@ -2154,9 +1225,10 @@ class KernelBuilder:
                     gI, gJ, gK, gL = g+8, g+9, g+10, g+11
                     gM, gN, gO, gP = g+12, g+13, g+14, g+15
                     pA, pB, pC, pD = 0, 1, 2, 3
-                    pE, pF, pG, pH = 0, 1, 2, 3
+                    # 012a: EFGH use pairs 4-7 (lsb/cmp scratch repurposed as t1/t2 ext)
+                    pE, pF, pG, pH = 4, 5, 6, 7
                     pI, pJ, pK, pL = 0, 1, 2, 3
-                    pM, pN, pO, pP = 0, 1, 2, 3
+                    pM, pN, pO, pP = 4, 5, 6, 7
                     return dict(
                         gA=gA, gB=gB, gC=gC, gD=gD,
                         gE=gE, gF=gF, gG=gG, gH=gH,
