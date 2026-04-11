@@ -1034,6 +1034,9 @@ class KernelBuilder:
         # Safe because A/E finish pair 0 before I/M start.
         body = []
 
+        # Track whether stores have been injected into body (014c optimization)
+        stores_injected_in_body = False
+
         # Track which rounds have their node values prefetched during preceding mod0 round
         # mod0_prefetched_for[rnd] = True if rnd's nodes were prefetched in a prior mod0 round
         mod0_prefetched_for = {}
@@ -1506,14 +1509,16 @@ class KernelBuilder:
                     # Step 49: L.idx[4] + M.hash[11] + N.hash[5:7] + O.hash[1:3]
                     body.append(l_idx[4]); body.append(m_hash[11]); body.append(n_hash[5]); body.append(n_hash[6]); body.append(o_hash[1]); body.append(o_hash[2])
 
-                def emit_hextet_tail_steps50_63(body, s, next_s=None):
+                def emit_hextet_tail_steps50_63(body, s, next_s=None, store_inject=None):
                     """Emit hextet steps 50-63.
                     If next_s is provided, interleave next hextet's A/B/C/D addr+loads
                     during these pure-valu tail steps (load engine otherwise idle).
                     KEY OPTIMIZATION: All 4 addr ops (A,B,C,D) are emitted FIRST (prepended
-                    before step 50 valu ops) so that loads can start as early as possible
-                    (packer places addrs in bundle ~52, enabling loads at bundle ~53 instead
-                    of the old approach where na_addr ended up at bundle ~65).
+                    before step 50 valu ops) so that loads can start as early as possible.
+                    If store_inject is provided (list of (engine, slot) tuples), inject
+                    them 2-at-a-time after each step's ops. Store engine is idle during tail
+                    so these pack into the same bundle, saving cycles vs sequential store.
+                    014c: Used to overlap final-round stores with the last hextet0/hextet1 tail.
                     """
                     m_idx=s['m_idx']; n_idx=s['n_idx']; o_idx=s['o_idx']; p_idx=s['p_idx']
                     n_hash=s['n_hash']; o_hash=s['o_hash']; p_hash=s['p_hash']
@@ -1536,6 +1541,17 @@ class KernelBuilder:
                         nc_loads = []
                         nd_addr = []
 
+                    # Prepare store injection iterator (014c)
+                    si = iter(store_inject) if store_inject else iter([])
+
+                    def inject_stores(n=2):
+                        """Append up to n store ops from store_inject to body."""
+                        for _ in range(n):
+                            try:
+                                body.append(next(si))
+                            except StopIteration:
+                                break
+
                     # CRITICAL OPTIMIZATION: Emit ALL addr ops FIRST (before step 50 valu ops).
                     # This ensures the packer places them in the first tail bundle (~bundle 52),
                     # allowing loads to start at bundle ~53 instead of ~66.
@@ -1549,49 +1565,65 @@ class KernelBuilder:
 
                     # Step 50: M.idx[0] + N.hash[7] + O.hash[3] + P.hash[0]
                     body.append(m_idx[0]); body.append(n_hash[7]); body.append(o_hash[3]); body.append(p_hash[0])
+                    inject_stores()
                     # Step 51: M.idx[1] + N.hash[8] + O.hash[4] + P.hash[1:3] [+ next_A.loads[0:2]]
                     body.append(m_idx[1]); body.append(n_hash[8]); body.append(o_hash[4])
                     body.append(p_hash[1]); body.append(p_hash[2])
                     body.extend(na_loads[0:2])  # load slots (na_addr already in past bundle)
+                    inject_stores()
                     # Step 52: M.idx[2] + N.hash[9:11] + O.hash[5:7] + P.hash[3] [+ next_A.loads[2:4]]
                     body.append(m_idx[2]); body.append(n_hash[9]); body.append(n_hash[10])
                     body.append(o_hash[5]); body.append(o_hash[6]); body.append(p_hash[3])
                     body.extend(na_loads[2:4])
+                    inject_stores()
                     # Step 53: M.idx[3] + N.hash[11] + O.hash[7] + P.hash[4] [+ next_A.loads[4:6]]
                     body.append(m_idx[3]); body.append(n_hash[11]); body.append(o_hash[7]); body.append(p_hash[4])
                     body.extend(na_loads[4:6])
+                    inject_stores()
                     # Step 54: M.idx[4] + N.idx[0] + O.hash[8] + P.hash[5:7] [+ next_A.loads[6:8]]
                     body.append(m_idx[4]); body.append(n_idx[0]); body.append(o_hash[8])
                     body.append(p_hash[5]); body.append(p_hash[6])
                     body.extend(na_loads[6:8])
+                    inject_stores()
                     # Step 55: N.idx[1] + O.hash[9:11] + P.hash[7] [+ next_B.loads[0:2]]
                     body.append(n_idx[1]); body.append(o_hash[9]); body.append(o_hash[10]); body.append(p_hash[7])
                     body.extend(nb_loads[0:2])
+                    inject_stores()
                     # Step 56: N.idx[2] + O.hash[11] + P.hash[8] [+ next_B.loads[2:4]]
                     body.append(n_idx[2]); body.append(o_hash[11]); body.append(p_hash[8])
                     body.extend(nb_loads[2:4])
+                    inject_stores()
                     # Step 57: N.idx[3] + O.idx[0] + P.hash[9:11] [+ next_B.loads[4:6]]
                     body.append(n_idx[3]); body.append(o_idx[0]); body.append(p_hash[9]); body.append(p_hash[10])
                     body.extend(nb_loads[4:6])
+                    inject_stores()
                     # Step 58: N.idx[4] + O.idx[1] + P.hash[11] [+ next_B.loads[6:8]]
                     body.append(n_idx[4]); body.append(o_idx[1]); body.append(p_hash[11])
                     body.extend(nb_loads[6:8])
+                    inject_stores()
                     # Step 59: O.idx[2] + P.idx[0] [+ next_C.loads[0:2]]
                     body.append(o_idx[2]); body.append(p_idx[0])
                     body.extend(nc_loads[0:2])
+                    inject_stores()
                     # Step 60: O.idx[3] + P.idx[1] [+ next_C.loads[2:4]]
                     body.append(o_idx[3]); body.append(p_idx[1])
                     body.extend(nc_loads[2:4])
+                    inject_stores()
                     # Step 61: O.idx[4] + P.idx[2] [+ next_C.loads[4:6]]
                     body.append(o_idx[4]); body.append(p_idx[2])
                     body.extend(nc_loads[4:6])
+                    inject_stores()
                     # Step 62: P.idx[3] [+ next_C.loads[6:8]]
                     body.append(p_idx[3])
                     body.extend(nc_loads[6:8])
+                    inject_stores()
                     # Step 63: P.idx[4]
                     # nd_addr is already emitted at start of tail (first bundle).
                     # D loads are handled in hextet1 body step 3 (which does a_xor + d_loads[:2]).
                     body.append(p_idx[4])
+                    inject_stores()  # any remaining store ops after P.idx[4]
+                    # Drain any leftover store_inject ops (e.g. g31 idx/val if overflow)
+                    body.extend(si)
 
                 def emit_hextet_body_steps3_63(body, s, next_round_s0=None, emit_tail=True, intra_hextet_s=None, d_preloaded=False):
                     """Emit hextet steps 3-63 (skipping A head: addr and loads already done).
@@ -1839,6 +1871,43 @@ class KernelBuilder:
                 # The tail must now: finish C[6:8] (2 loads) + D loads (8) in steps 51-58
                 # We pass a partial next_s where: a_loads=D.loads (for steps 51-54),
                 # c_loads=C.loads[6:8] (for steps 59 area), and everything else empty.
+                # Detect last round for store injection optimization
+                is_last_round = (rnd == rounds - 1)
+
+                # OPTIMIZATION (014c): Build store_inject lists for last round.
+                # By injecting vstores into hextet tails, we overlap the store phase
+                # with the final round's computation. Store engine is idle during all tails.
+                # - store_inject_hex0: groups 0-15 vstores, injected into hextet0 tail
+                # - store_inject_hex1: groups 16-31 vstores, injected into hextet1 tail
+                # Groups 0-15 are complete at the end of hextet0, safe to store in hextet0 tail.
+                # Groups 16-31 idx[4] complete during hextet1 body/tail (A-L in body, M-P in tail).
+                # Since store_inject is consumed in order (g16, g17, ..., g31) and steps 50-63
+                # consume 2 per step: g16 at step 50, ..., g27 at step 61, g28 at step 62,
+                # g29 at step 63, g30+g31 overflow after P.idx[4].
+                # Safety: gX's vstore injected at step S requires gX.idx[4] completed before S.
+                # - g16-g27 (A-L) complete in hextet1 body steps 17-49, well before step 50. Safe.
+                # - g28 (M): M.idx[4] at tail step 54; vstore consumed at step 62 (62>54). Safe.
+                # - g29 (N): N.idx[4] at step 58; vstore at step 63 (63>58). Safe.
+                # - g30 (O): O.idx[4] at step 61; vstore after P.idx[4] in drain, but body list
+                #   order: O.idx[4] in step 61, then P.idx[3]/P.idx[4] in 62/63, then drain.
+                #   Packer sees O.idx[4] before g30 vstore. Safe.
+                # - g31 (P): P.idx[4] at step 63; vstore in drain after P.idx[4]. Packer sees
+                #   P.idx[4] writes idx_base+31*8..+7. g31 vstore reads same. RAW → next bundle.
+                #   But it's correct (vstore reads final value). 1 extra cycle for g31 pair.
+                if is_last_round:
+                    store_inject_hex0 = []
+                    for g in range(16):
+                        store_inject_hex0.append(("store", ("vstore", addr_idx_g[g], idx_base + g * VLEN)))
+                        store_inject_hex0.append(("store", ("vstore", addr_val_g[g], val_base + g * VLEN)))
+                    store_inject_hex1 = []
+                    for g in range(16, 32):
+                        store_inject_hex1.append(("store", ("vstore", addr_idx_g[g], idx_base + g * VLEN)))
+                        store_inject_hex1.append(("store", ("vstore", addr_val_g[g], val_base + g * VLEN)))
+                    stores_injected_in_body = True
+                else:
+                    store_inject_hex0 = None
+                    store_inject_hex1 = None
+
                 if prev_prefetched:
                     # intra_hextet_s was used - pass partial tail prefetch
                     intra_tail_next_s = {
@@ -1850,28 +1919,34 @@ class KernelBuilder:
                         'c_loads': s1['c_loads'][6:8],  # remaining C[6:8] → tail step 59
                         'd_addr': [],            # D addr already in hextet0 body step 3
                     }
-                    emit_hextet_tail_steps50_63(body, s0, next_s=intra_tail_next_s)
+                    emit_hextet_tail_steps50_63(body, s0, next_s=intra_tail_next_s,
+                                               store_inject=store_inject_hex0)
                     # Emit hextet1 steps 3-49 with D preloaded (skip d_loads in steps 3-6)
                     emit_hextet_body_steps3_63(body, s1, emit_tail=False, d_preloaded=True)
                 else:
-                    emit_hextet_tail_steps50_63(body, s0, next_s=s1)
+                    emit_hextet_tail_steps50_63(body, s0, next_s=s1,
+                                               store_inject=store_inject_hex0)
                     # Emit hextet1 steps 3-49 (A head already done in hextet0 tail)
                     emit_hextet_body_steps3_63(body, s1, emit_tail=False)
                 # Emit hextet1 steps 50-63 (with optional next-round hextet0 prefetch)
                 s0_next = s0 if next_normal else None  # next round uses same groups!
-                emit_hextet_tail_steps50_63(body, s1, next_s=s0_next)
+                emit_hextet_tail_steps50_63(body, s1, next_s=s0_next,
+                                           store_inject=store_inject_hex1)
 
         # --- Store final idx and val vectors back to memory ---
         # OPTIMIZATION (013): addr_idx_g[g] and addr_val_g[g] are computed once during init
         # and are NEVER overwritten during the main loop body (verified: only written in init
         # and here). Skip the 64 redundant alu recomputations (~6 cycles saved).
+        # OPTIMIZATION (014c): If last round is a normal round, all vstores are injected
+        # into the hextet0/hextet1 tails above (stores_injected_in_body=True). Skip this phase.
         store_slots = []
-        # All vstores (interleaved: idx then val per group so packer fills 2 store slots/cycle)
-        for g in range(n_groups):
-            idx_addr = idx_base + g * VLEN
-            val_addr = val_base + g * VLEN
-            store_slots.append(("store", ("vstore", addr_idx_g[g], idx_addr)))
-            store_slots.append(("store", ("vstore", addr_val_g[g], val_addr)))
+        if not stores_injected_in_body:
+            # All vstores (interleaved: idx then val per group so packer fills 2 store slots/cycle)
+            for g in range(n_groups):
+                idx_addr = idx_base + g * VLEN
+                val_addr = val_base + g * VLEN
+                store_slots.append(("store", ("vstore", addr_idx_g[g], idx_addr)))
+                store_slots.append(("store", ("vstore", addr_val_g[g], val_addr)))
 
         # Build the main body with VLIW packing
         body_instrs = self.build(body)
