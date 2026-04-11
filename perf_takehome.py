@@ -597,7 +597,7 @@ class KernelBuilder:
         # --- No-load hextet: pure valu hextet for rounds with broadcast nv ---
         # Uses the same careful diagonal ordering as the normal hextet (just no addr/load).
         # This ensures pair-reuse safety (same as normal hextet).
-        def emit_hextet_noload(body, grp_start, nv_bcast, next_s=None, skip_xors=False, tail_inject_xors=None):
+        def emit_hextet_noload(body, grp_start, nv_bcast, next_s=None, skip_xors=False, tail_inject_xors=None, post_xor_inject=None):
             """Emit 16-group no-load hextet using nv_bcast for xor.
             Uses the exact same diagonal ordering as normal hextet (steps 1-63),
             but skips all addr and load slots, replacing xor with bcast-xor.
@@ -605,7 +605,10 @@ class KernelBuilder:
             If next_s is provided, prefetch next round's hextet0 head in the tail.
             If skip_xors=True, skip emitting the xor phase (already done externally).
             If tail_inject_xors is provided (list of xor slots), inject them into
-            the free valu slots of tail steps 59-63 (which have 2-1 ops each)."""
+            the free valu slots of tail steps 59-63 (which have 2-1 ops each).
+            If post_xor_inject is provided (list of (engine, slot) tuples), inject them
+            AFTER the xor phase but BEFORE hash+idx. Load engine is free during hash+idx,
+            so load slots here will overlap with hash/idx valu work (zero extra cycles)."""
             gA, gB, gC, gD = grp_start, grp_start+1, grp_start+2, grp_start+3
             gE, gF, gG, gH = grp_start+4, grp_start+5, grp_start+6, grp_start+7
             gI, gJ, gK, gL = grp_start+8, grp_start+9, grp_start+10, grp_start+11
@@ -688,6 +691,11 @@ class KernelBuilder:
                     body.extend(xv)
                 for xv in [m_xor, n_xor, o_xor, p_xor]:
                     body.extend(xv)
+            # OPTIMIZATION (013): inject post-xor slots (e.g. load prefetch ops) here.
+            # These pack into the first hash/idx bundle (load engine is free during all of hash/idx).
+            if post_xor_inject is not None:
+                for slot in post_xor_inject:
+                    body.append(slot)
             emit_octet_hash_idx_parallel(body, [gA,gB,gC,gD,gE,gF,gG,gH], [pA,pB,pC,pD,pE,pF,pG,pH])
             emit_octet_hash_idx_parallel(body, [gI,gJ,gK,gL,gM,gN,gO,gP], [pI,pJ,pK,pL,pM,pN,pO,pP])
             if tail_inject_xors is not None:
@@ -1026,16 +1034,16 @@ class KernelBuilder:
         # Safe because A/E finish pair 0 before I/M start.
         body = []
 
+        # Track which rounds have their node values prefetched during preceding mod0 round
+        # mod0_prefetched_for[rnd] = True if rnd's nodes were prefetched in a prior mod0 round
+        mod0_prefetched_for = {}
+
         for rnd in range(rounds):
             round_mod = rnd % 11
 
             if round_mod == 0:
                 # === Special: all idx=0, broadcast single tree node ===
                 # Load forest_values[0] = memory[forest_values_p + 0]
-                # fvp_vec[0] holds forest_values_p as address; lane 0 = the pointer value
-                # load_offset(dest, base, offset) reads scratch[base+offset] as address
-                # So load_offset(nv_scalar_r0, fvp_vec, 0) loads memory[scratch[fvp_vec+0]]
-                #   = memory[forest_values_p] = forest_values[0]
                 setup_slots = [
                     ("load", ("load_offset", nv_scalar_r0, fvp_vec, 0)),
                     ("valu", ("vbroadcast", nv_bcast_r0, nv_scalar_r0)),
@@ -1045,70 +1053,128 @@ class KernelBuilder:
                 body_pre.extend([(e, s) for instr in setup_instrs for e, slots in instr.items() for s in slots])
                 body.extend(body_pre)
 
+                # === OPTIMIZATION (013): Cross-round prefetch ===
+                # During the 2 hextets (~63+ cycles each) of this mod0 round, the load engine
+                # is completely idle. Use it to prefetch node values needed by subsequent
+                # mod1 (rnd+1) and mod2 (rnd+2) rounds. Their addresses are constant offsets
+                # from forest_values_p (no data dependency on computed idx values).
+                #
+                # Extended strategy: also precompute broadcasts and diffs during the hextet,
+                # so mod1/mod2 rounds can skip their entire setup overhead.
+                # Saves: mod1 ~2 cycles × 2 occurrences + mod2 ~3 cycles × 2 occurrences.
+                prefetch_next1 = (rnd + 1 < rounds and (rnd + 1) % 11 == 1)
+                prefetch_next2 = (rnd + 2 < rounds and (rnd + 2) % 11 == 2)
+
+                prefetch_addr_slots = []
+                post_inject_slots = []  # loads + broadcasts + diffs, injected post-xor
+
+                if prefetch_next1:
+                    # Compute fvp+1 → nv_node1_r1 (temp addr), fvp+2 → nv_node2_r1
+                    prefetch_addr_slots.append(("alu", ("+", nv_node1_r1, sc_forest_values_p, one_scalar)))
+                    prefetch_addr_slots.append(("alu", ("+", nv_node2_r1, sc_forest_values_p, two_scalar)))
+                    # Load from those addresses (overwriting with actual values)
+                    post_inject_slots.append(("load", ("load", nv_node1_r1, nv_node1_r1)))
+                    post_inject_slots.append(("load", ("load", nv_node2_r1, nv_node2_r1)))
+                    mod0_prefetched_for[rnd + 1] = 'full'  # 'full' = loads+bcasts+diff done
+
+                if prefetch_next2:
+                    # Compute fvp+3..+6 → nv_node3_r2..nv_node6_r2
+                    prefetch_addr_slots.append(("alu", ("+", nv_node3_r2, sc_forest_values_p, three_scalar)))
+                    prefetch_addr_slots.append(("alu", ("+", nv_node4_r2, sc_forest_values_p, four_scalar)))
+                    prefetch_addr_slots.append(("alu", ("+", nv_node5_r2, sc_forest_values_p, five_scalar)))
+                    prefetch_addr_slots.append(("alu", ("+", nv_node6_r2, sc_forest_values_p, six_scalar)))
+                    # Load from those addresses
+                    post_inject_slots.append(("load", ("load", nv_node3_r2, nv_node3_r2)))
+                    post_inject_slots.append(("load", ("load", nv_node4_r2, nv_node4_r2)))
+                    post_inject_slots.append(("load", ("load", nv_node5_r2, nv_node5_r2)))
+                    post_inject_slots.append(("load", ("load", nv_node6_r2, nv_node6_r2)))
+                    mod0_prefetched_for[rnd + 2] = 'full'
+
+                # After loads: precompute broadcasts and diffs for mod1/mod2 setups.
+                # These pack into free valu slots during hash+idx (2-op cycles have 4 free slots).
+                # RAW constraints: broadcasts must follow their load; diffs must follow broadcasts.
+                # The packer handles this automatically.
+                if prefetch_next1:
+                    # Broadcasts for mod1: nv_bcast1_r1 = nv_node1_r1, nv_bcast2_r1 = nv_node2_r1
+                    post_inject_slots.append(("valu", ("vbroadcast", nv_bcast1_r1, nv_node1_r1)))
+                    post_inject_slots.append(("valu", ("vbroadcast", nv_bcast2_r1, nv_node2_r1)))
+                    # diff_r1_vec = nv_bcast1_r1 - nv_bcast2_r1 (RAW after broadcasts)
+                    post_inject_slots.append(("valu", ("-", diff_r1_vec, nv_bcast1_r1, nv_bcast2_r1)))
+
+                if prefetch_next2:
+                    # Broadcasts for mod2: node3_bcast, node5_bcast (needed for arith4)
+                    post_inject_slots.append(("valu", ("vbroadcast", node3_bcast, nv_node3_r2)))
+                    post_inject_slots.append(("valu", ("vbroadcast", node5_bcast, nv_node5_r2)))
+                    # Intermediate broadcasts for diff computation (using pair temps before hash overwrites them)
+                    # node4_bcast_tmp = t1_tmp_pair[0], node6_bcast_tmp = t2_tmp_pair[0]
+                    # IMPORTANT: these are read to compute diffs BEFORE hash starts (hash overwrites t1/t2)
+                    node4_bcast_tmp = t1_tmp_pair[0]
+                    node6_bcast_tmp = t2_tmp_pair[0]
+                    post_inject_slots.append(("valu", ("vbroadcast", node4_bcast_tmp, nv_node4_r2)))
+                    post_inject_slots.append(("valu", ("vbroadcast", node6_bcast_tmp, nv_node6_r2)))
+                    post_inject_slots.append(("valu", ("vbroadcast", three_vec, three_scalar)))
+                    # Diffs (RAW after node3_bcast/node5_bcast and node4_bcast_tmp/node6_bcast_tmp)
+                    post_inject_slots.append(("valu", ("-", diff34_bcast, node4_bcast_tmp, node3_bcast)))
+                    post_inject_slots.append(("valu", ("-", diff56_bcast, node6_bcast_tmp, node5_bcast)))
+
+                # Inject alu addr ops into body now: pack with the vbroadcast cycle
+                for slot in prefetch_addr_slots:
+                    body.append(slot)
+
                 # Process 2 hextets (32 groups) with no loads.
-                # XOR INJECTION OPTIMIZATION: inject hextet1's 16 xors into hextet0's tail
-                # (free valu slots in steps 59-63), then skip xors in hextet1.
-                # This saves ~3 cycles per occurrence x 2 (rounds 0 and 11) = ~6 cycles total.
+                # XOR INJECTION: inject hextet1's 16 xors into hextet0's tail.
+                # POST_XOR_INJECT: inject loads + bcasts + diffs into hextet0's hash/idx section.
                 hex1_xors = [group_xor_bcast_slots(g, nv_bcast_r0)[0] for g in range(16, n_groups)]
-                emit_hextet_noload(body, 0, nv_bcast_r0, tail_inject_xors=hex1_xors)
+                emit_hextet_noload(body, 0, nv_bcast_r0, tail_inject_xors=hex1_xors,
+                                   post_xor_inject=post_inject_slots if post_inject_slots else None)
                 emit_hextet_noload(body, 16, nv_bcast_r0, skip_xors=True)
 
             elif round_mod == 1:
                 # === Special: idx in {1,2}, load 2 nodes + vselect ===
-                # Load forest_values[1] = memory[forest_values_p + 1]
-                # Load forest_values[2] = memory[forest_values_p + 2]
-                # fvp_vec[1] = forest_values_p (same value repeated), so:
-                # load_offset(nv_node1_r1, fvp_vec, 1) loads memory[scratch[fvp_vec+1]]
-                #   = memory[forest_values_p] = forest_values[0]  ← WRONG: fvp_vec is a vector
-                #   where all 8 lanes have value forest_values_p. So fvp_vec[1] = forest_values_p.
-                #   load_offset reads scratch[fvp_vec + 1] as address, which = forest_values_p.
-                #   This gives forest_values[0] again, not forest_values[1]!
-                #
-                # Correct approach: we need address forest_values_p+1 and forest_values_p+2.
-                # Use add_imm (flow engine):
-                #   tmp_addr1 = forest_values_p + 1
-                #   tmp_addr2 = forest_values_p + 2
-                # Then load from those addresses.
-                # But add_imm writes to a scalar scratch location. We need temp scalars.
-                # We'll use nv_node1_r1 and nv_node2_r1 as temp address holders.
-                # Use alu + instead of flow add_imm (alu has 12 slots/cycle → both ops in 1 bundle)
-                setup_slots = [
-                    # Compute address forest_values_p+1 into nv_node1_r1
-                    ("alu", ("+", nv_node1_r1, sc_forest_values_p, one_scalar)),
-                    # Compute address forest_values_p+2 into nv_node2_r1
-                    ("alu", ("+", nv_node2_r1, sc_forest_values_p, two_scalar)),
-                ]
-                setup_instrs1 = self.build(setup_slots)
-                for instr in setup_instrs1:
-                    for e, slist in instr.items():
-                        for s in slist:
-                            body.append((e, s))
+                # OPTIMIZATION (013): If prefetched during prior mod0 round, skip addr+load setup.
+                if not mod0_prefetched_for.get(rnd, False):
+                    # Not prefetched - compute addresses and load nodes normally
+                    # Use alu + instead of flow add_imm (alu has 12 slots/cycle → both ops in 1 bundle)
+                    setup_slots = [
+                        # Compute address forest_values_p+1 into nv_node1_r1
+                        ("alu", ("+", nv_node1_r1, sc_forest_values_p, one_scalar)),
+                        # Compute address forest_values_p+2 into nv_node2_r1
+                        ("alu", ("+", nv_node2_r1, sc_forest_values_p, two_scalar)),
+                    ]
+                    setup_instrs1 = self.build(setup_slots)
+                    for instr in setup_instrs1:
+                        for e, slist in instr.items():
+                            for s in slist:
+                                body.append((e, s))
 
-                # Now load from those addresses
-                # load(dest, addr): loads memory[scratch[addr]] into dest
-                load_slots = [
-                    ("load", ("load", nv_node1_r1, nv_node1_r1)),
-                    ("load", ("load", nv_node2_r1, nv_node2_r1)),
-                ]
-                load_instrs = self.build(load_slots)
-                for instr in load_instrs:
-                    for e, slist in instr.items():
-                        for s in slist:
-                            body.append((e, s))
+                    # Now load from those addresses
+                    load_slots = [
+                        ("load", ("load", nv_node1_r1, nv_node1_r1)),
+                        ("load", ("load", nv_node2_r1, nv_node2_r1)),
+                    ]
+                    load_instrs = self.build(load_slots)
+                    for instr in load_instrs:
+                        for e, slist in instr.items():
+                            for s in slist:
+                                body.append((e, s))
+                # else: nv_node1_r1 and nv_node2_r1 already hold the loaded values
 
-                # Broadcast both nodes
-                bcast_slots = [
-                    ("valu", ("vbroadcast", nv_bcast1_r1, nv_node1_r1)),
-                    ("valu", ("vbroadcast", nv_bcast2_r1, nv_node2_r1)),
-                ]
-                bcast_instrs = self.build(bcast_slots)
-                for instr in bcast_instrs:
-                    for e, slist in instr.items():
-                        for s in slist:
-                            body.append((e, s))
+                if mod0_prefetched_for.get(rnd) != 'full':
+                    # Not fully prefetched - compute broadcasts and diff normally
+                    # Broadcast both nodes
+                    bcast_slots = [
+                        ("valu", ("vbroadcast", nv_bcast1_r1, nv_node1_r1)),
+                        ("valu", ("vbroadcast", nv_bcast2_r1, nv_node2_r1)),
+                    ]
+                    bcast_instrs = self.build(bcast_slots)
+                    for instr in bcast_instrs:
+                        for e, slist in instr.items():
+                            for s in slist:
+                                body.append((e, s))
 
-                # Compute diff_r1_vec = node1 - node2 (for arithmetic select)
-                body.append(("valu", ("-", diff_r1_vec, nv_bcast1_r1, nv_bcast2_r1)))
+                    # Compute diff_r1_vec = node1 - node2 (for arithmetic select)
+                    body.append(("valu", ("-", diff_r1_vec, nv_bcast1_r1, nv_bcast2_r1)))
+                # else: nv_bcast1_r1, nv_bcast2_r1, diff_r1_vec already computed during mod0
 
                 # Process 2 hextets with arithmetic vselect (no flow engine)
                 for hextet_start in range(0, n_groups, 16):
@@ -1116,78 +1182,80 @@ class KernelBuilder:
 
             elif round_mod == 2:
                 # === Special: idx in {3,4,5,6}, load 4 nodes + arithmetic 2-level select ===
-                # Load nodes 3,4,5,6 from forest_values.
-                # Use add_imm to compute addresses forest_values_p+3..+6.
-                # Re-use nv_nodeX_r2 scratch as temp address holders.
-                # Use alu + instead of flow add_imm (all 4 ops can pack in 1 alu bundle)
-                setup_addr_slots = [
-                    ("alu", ("+", nv_node3_r2, sc_forest_values_p, three_scalar)),
-                    ("alu", ("+", nv_node4_r2, sc_forest_values_p, four_scalar)),
-                    ("alu", ("+", nv_node5_r2, sc_forest_values_p, five_scalar)),
-                    ("alu", ("+", nv_node6_r2, sc_forest_values_p, six_scalar)),
-                ]
-                si_instrs = self.build(setup_addr_slots)
-                for instr in si_instrs:
-                    for e, slist in instr.items():
-                        for s in slist:
-                            body.append((e, s))
+                # OPTIMIZATION (013): If prefetched during prior mod0 round, skip addr+load setup.
+                if not mod0_prefetched_for.get(rnd, False):
+                    # Not prefetched - compute addresses and load nodes normally
+                    # Use alu + instead of flow add_imm (all 4 ops can pack in 1 alu bundle)
+                    setup_addr_slots = [
+                        ("alu", ("+", nv_node3_r2, sc_forest_values_p, three_scalar)),
+                        ("alu", ("+", nv_node4_r2, sc_forest_values_p, four_scalar)),
+                        ("alu", ("+", nv_node5_r2, sc_forest_values_p, five_scalar)),
+                        ("alu", ("+", nv_node6_r2, sc_forest_values_p, six_scalar)),
+                    ]
+                    si_instrs = self.build(setup_addr_slots)
+                    for instr in si_instrs:
+                        for e, slist in instr.items():
+                            for s in slist:
+                                body.append((e, s))
 
-                # Load node values (all 4 can pack: 2 load slots/cycle → 2 bundles)
-                load_slots = [
-                    ("load", ("load", nv_node3_r2, nv_node3_r2)),
-                    ("load", ("load", nv_node4_r2, nv_node4_r2)),
-                    ("load", ("load", nv_node5_r2, nv_node5_r2)),
-                    ("load", ("load", nv_node6_r2, nv_node6_r2)),
-                ]
-                ls_instrs = self.build(load_slots)
-                for instr in ls_instrs:
-                    for e, slist in instr.items():
-                        for s in slist:
-                            body.append((e, s))
+                    # Load node values (all 4 can pack: 2 load slots/cycle → 2 bundles)
+                    load_slots = [
+                        ("load", ("load", nv_node3_r2, nv_node3_r2)),
+                        ("load", ("load", nv_node4_r2, nv_node4_r2)),
+                        ("load", ("load", nv_node5_r2, nv_node5_r2)),
+                        ("load", ("load", nv_node6_r2, nv_node6_r2)),
+                    ]
+                    ls_instrs = self.build(load_slots)
+                    for instr in ls_instrs:
+                        for e, slist in instr.items():
+                            for s in slist:
+                                body.append((e, s))
+                # else: nv_node3_r2..nv_node6_r2 already hold the loaded values
 
-                # Broadcast node3 and node5
-                bcast_slots_r2a = [
-                    ("valu", ("vbroadcast", node3_bcast, nv_node3_r2)),
-                    ("valu", ("vbroadcast", node5_bcast, nv_node5_r2)),
-                ]
-                bcast_r2a_instrs = self.build(bcast_slots_r2a)
-                for instr in bcast_r2a_instrs:
-                    for e, slist in instr.items():
-                        for s in slist:
-                            body.append((e, s))
+                if mod0_prefetched_for.get(rnd) != 'full':
+                    # Not fully prefetched - compute broadcasts and diffs normally
+                    # Broadcast node3 and node5
+                    bcast_slots_r2a = [
+                        ("valu", ("vbroadcast", node3_bcast, nv_node3_r2)),
+                        ("valu", ("vbroadcast", node5_bcast, nv_node5_r2)),
+                    ]
+                    bcast_r2a_instrs = self.build(bcast_slots_r2a)
+                    for instr in bcast_r2a_instrs:
+                        for e, slist in instr.items():
+                            for s in slist:
+                                body.append((e, s))
 
-                # Compute diff34 = node4 - node3, diff56 = node6 - node5 (valu)
-                # Also broadcast three_vec = three_scalar (needed for sub = idx - 3)
-                # nv_node4_r2 and nv_node6_r2 are scalars; diff34/diff56 are vectors.
-                # We need to broadcast node4 and node6 first to compute diffs as vectors.
-                # Simpler: broadcast all 4 nodes, then compute diffs.
-                # Actually: multiply_add(dest, bit0, diff34_bcast, node3_bcast) works with vectors.
-                # node4_bcast and node6_bcast are intermediate temps. We can reuse pair scratch.
-                # Use t1_tmp_pair[0] as node4_bcast_tmp and t2_tmp_pair[0] as node6_bcast_tmp.
-                # These will be overwritten in the hextet, but that's fine since we compute diffs first.
-                node4_bcast_tmp = t1_tmp_pair[0]
-                node6_bcast_tmp = t2_tmp_pair[0]
-                bcast_slots_r2b = [
-                    ("valu", ("vbroadcast", node4_bcast_tmp, nv_node4_r2)),
-                    ("valu", ("vbroadcast", node6_bcast_tmp, nv_node6_r2)),
-                    ("valu", ("vbroadcast", three_vec, three_scalar)),
-                ]
-                bcast_r2b_instrs = self.build(bcast_slots_r2b)
-                for instr in bcast_r2b_instrs:
-                    for e, slist in instr.items():
-                        for s in slist:
-                            body.append((e, s))
+                    # Compute diff34 = node4 - node3, diff56 = node6 - node5 (valu)
+                    # Also broadcast three_vec = three_scalar (needed for sub = idx - 3)
+                    # nv_node4_r2 and nv_node6_r2 are scalars; diff34/diff56 are vectors.
+                    # We need to broadcast node4 and node6 first to compute diffs as vectors.
+                    # Use t1_tmp_pair[0] as node4_bcast_tmp and t2_tmp_pair[0] as node6_bcast_tmp.
+                    # These will be overwritten in the hextet, but that's fine since we compute diffs first.
+                    node4_bcast_tmp = t1_tmp_pair[0]
+                    node6_bcast_tmp = t2_tmp_pair[0]
+                    bcast_slots_r2b = [
+                        ("valu", ("vbroadcast", node4_bcast_tmp, nv_node4_r2)),
+                        ("valu", ("vbroadcast", node6_bcast_tmp, nv_node6_r2)),
+                        ("valu", ("vbroadcast", three_vec, three_scalar)),
+                    ]
+                    bcast_r2b_instrs = self.build(bcast_slots_r2b)
+                    for instr in bcast_r2b_instrs:
+                        for e, slist in instr.items():
+                            for s in slist:
+                                body.append((e, s))
 
-                # Compute diffs (valu)
-                diff_slots = [
-                    ("valu", ("-", diff34_bcast, node4_bcast_tmp, node3_bcast)),
-                    ("valu", ("-", diff56_bcast, node6_bcast_tmp, node5_bcast)),
-                ]
-                diff_instrs = self.build(diff_slots)
-                for instr in diff_instrs:
-                    for e, slist in instr.items():
-                        for s in slist:
-                            body.append((e, s))
+                    # Compute diffs (valu)
+                    diff_slots = [
+                        ("valu", ("-", diff34_bcast, node4_bcast_tmp, node3_bcast)),
+                        ("valu", ("-", diff56_bcast, node6_bcast_tmp, node5_bcast)),
+                    ]
+                    diff_instrs = self.build(diff_slots)
+                    for instr in diff_instrs:
+                        for e, slist in instr.items():
+                            for s in slist:
+                                body.append((e, s))
+                # else: node3_bcast, node5_bcast, diff34_bcast, diff56_bcast, three_vec
+                #       all precomputed during mod0 round
 
                 # Process 2 hextets with 4-node arithmetic select
                 # For the last hextet (grp_start=16), if next round is normal,
@@ -1794,15 +1862,10 @@ class KernelBuilder:
                 emit_hextet_tail_steps50_63(body, s1, next_s=s0_next)
 
         # --- Store final idx and val vectors back to memory ---
-        # OPTIMIZED STORE: emit all idx alu ops first, then all val alu ops, then all vstores.
-        # Per-group scalars eliminate WAW serialization (same as init optimization).
+        # OPTIMIZATION (013): addr_idx_g[g] and addr_val_g[g] are computed once during init
+        # and are NEVER overwritten during the main loop body (verified: only written in init
+        # and here). Skip the 64 redundant alu recomputations (~6 cycles saved).
         store_slots = []
-        # All idx addr computations (32 alu ops, independent -> pack 12/cycle -> 3 cycles)
-        for g in range(n_groups):
-            store_slots.append(("alu", ("+", addr_idx_g[g], self.scratch["inp_indices_p"], group_offset_scalars[g])))
-        # All val addr computations (32 alu ops, independent)
-        for g in range(n_groups):
-            store_slots.append(("alu", ("+", addr_val_g[g], self.scratch["inp_values_p"], group_offset_scalars[g])))
         # All vstores (interleaved: idx then val per group so packer fills 2 store slots/cycle)
         for g in range(n_groups):
             idx_addr = idx_base + g * VLEN
