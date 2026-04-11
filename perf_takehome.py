@@ -1511,19 +1511,20 @@ class KernelBuilder:
 
                 def emit_hextet_tail_steps50_63(body, s, next_s=None, store_inject=None):
                     """Emit hextet steps 50-63.
-                    If next_s is provided, interleave next hextet's A/B/C/D addr+loads
+                    If next_s is provided, interleave next hextet's A/B/C/D/E addr+loads
                     during these pure-valu tail steps (load engine otherwise idle).
-                    KEY OPTIMIZATION: All 4 addr ops (A,B,C,D) are emitted FIRST (prepended
+                    KEY OPTIMIZATION: All addr ops (A,B,C,D,E) are emitted FIRST (prepended
                     before step 50 valu ops) so that loads can start as early as possible.
                     If store_inject is provided (list of (engine, slot) tuples), inject
                     them 2-at-a-time after each step's ops. Store engine is idle during tail
                     so these pack into the same bundle, saving cycles vs sequential store.
                     014c: Used to overlap final-round stores with the last hextet0/hextet1 tail.
+                    015b: Extended prefetch to cover E group loads (steps 55-58 previously empty).
                     """
                     m_idx=s['m_idx']; n_idx=s['n_idx']; o_idx=s['o_idx']; p_idx=s['p_idx']
                     n_hash=s['n_hash']; o_hash=s['o_hash']; p_hash=s['p_hash']
 
-                    # Prepare next-hextet A+B+C+D head slots (if overlapping)
+                    # Prepare next-hextet A+B+C+D+E head slots (if overlapping)
                     if next_s is not None:
                         na_addr = next_s['a_addr']     # 1 valu slot
                         na_loads = next_s['a_loads']   # 8 load slots
@@ -1532,6 +1533,15 @@ class KernelBuilder:
                         nc_addr = next_s['c_addr']     # 1 valu slot
                         nc_loads = next_s['c_loads']   # 8 load slots
                         nd_addr = next_s['d_addr']     # 1 valu slot (D loads start in hextet1 body)
+                        # 015b: E addr+loads prefetch only when nb_loads is empty (intra_tail path).
+                        # If nb_loads is non-empty, steps 55-58 already have 2 loads from nb_loads;
+                        # adding ne_loads would exceed the 2-load-slot limit.
+                        if not nb_loads:
+                            ne_addr = next_s.get('e_addr', [])   # 1 valu slot
+                            ne_loads = next_s.get('e_loads', []) # 8 load slots
+                        else:
+                            ne_addr = []
+                            ne_loads = []
                     else:
                         na_addr = []
                         na_loads = []
@@ -1540,6 +1550,8 @@ class KernelBuilder:
                         nc_addr = []
                         nc_loads = []
                         nd_addr = []
+                        ne_addr = []
+                        ne_loads = []
 
                     # Prepare store injection iterator (014c)
                     si = iter(store_inject) if store_inject else iter([])
@@ -1558,10 +1570,12 @@ class KernelBuilder:
                     # Previously, na_addr was interleaved at step 50 (appended after 4 valu ops),
                     # causing the packer to push na_addr to bundle 65 (last tail bundle) due to
                     # VALU saturation in earlier tail steps.
+                    # 015b: Also emit ne_addr early so E.loads can start at step 55.
                     body.extend(na_addr)   # next A group addr: write addr_tmp_g[gA2]
                     body.extend(nb_addr)   # next B group addr: independent of na_addr writes
                     body.extend(nc_addr)   # next C group addr
                     body.extend(nd_addr)   # next D group addr
+                    body.extend(ne_addr)   # next E group addr (015b: E addr for prefetch into steps 55-58)
 
                     # Step 50: M.idx[0] + N.hash[7] + O.hash[3] + P.hash[0]
                     body.append(m_idx[0]); body.append(n_hash[7]); body.append(o_hash[3]); body.append(p_hash[0])
@@ -1585,21 +1599,21 @@ class KernelBuilder:
                     body.append(p_hash[5]); body.append(p_hash[6])
                     body.extend(na_loads[6:8])
                     inject_stores()
-                    # Step 55: N.idx[1] + O.hash[9:11] + P.hash[7] [+ next_B.loads[0:2]]
+                    # Step 55: N.idx[1] + O.hash[9:11] + P.hash[7] [+ next_B.loads[0:2]] [+ next_E.loads[0:2]]
                     body.append(n_idx[1]); body.append(o_hash[9]); body.append(o_hash[10]); body.append(p_hash[7])
-                    body.extend(nb_loads[0:2])
+                    body.extend(nb_loads[0:2]); body.extend(ne_loads[0:2])
                     inject_stores()
-                    # Step 56: N.idx[2] + O.hash[11] + P.hash[8] [+ next_B.loads[2:4]]
+                    # Step 56: N.idx[2] + O.hash[11] + P.hash[8] [+ next_B.loads[2:4]] [+ next_E.loads[2:4]]
                     body.append(n_idx[2]); body.append(o_hash[11]); body.append(p_hash[8])
-                    body.extend(nb_loads[2:4])
+                    body.extend(nb_loads[2:4]); body.extend(ne_loads[2:4])
                     inject_stores()
-                    # Step 57: N.idx[3] + O.idx[0] + P.hash[9:11] [+ next_B.loads[4:6]]
+                    # Step 57: N.idx[3] + O.idx[0] + P.hash[9:11] [+ next_B.loads[4:6]] [+ next_E.loads[4:6]]
                     body.append(n_idx[3]); body.append(o_idx[0]); body.append(p_hash[9]); body.append(p_hash[10])
-                    body.extend(nb_loads[4:6])
+                    body.extend(nb_loads[4:6]); body.extend(ne_loads[4:6])
                     inject_stores()
-                    # Step 58: N.idx[4] + O.idx[1] + P.hash[11] [+ next_B.loads[6:8]]
+                    # Step 58: N.idx[4] + O.idx[1] + P.hash[11] [+ next_B.loads[6:8]] [+ next_E.loads[6:8]]
                     body.append(n_idx[4]); body.append(o_idx[1]); body.append(p_hash[11])
-                    body.extend(nb_loads[6:8])
+                    body.extend(nb_loads[6:8]); body.extend(ne_loads[6:8])
                     inject_stores()
                     # Step 59: O.idx[2] + P.idx[0] [+ next_C.loads[0:2]]
                     body.append(o_idx[2]); body.append(p_idx[0])
@@ -1625,7 +1639,7 @@ class KernelBuilder:
                     # Drain any leftover store_inject ops (e.g. g31 idx/val if overflow)
                     body.extend(si)
 
-                def emit_hextet_body_steps3_63(body, s, next_round_s0=None, emit_tail=True, intra_hextet_s=None, d_preloaded=False):
+                def emit_hextet_body_steps3_63(body, s, next_round_s0=None, emit_tail=True, intra_hextet_s=None, d_preloaded=False, e_preloaded=False):
                     """Emit hextet steps 3-63 (skipping A head: addr and loads already done).
                     If next_round_s0 is provided, the tail will prefetch next round's hextet0 head.
                     If emit_tail=False, only steps 3-49 are emitted (caller handles the tail).
@@ -1637,6 +1651,8 @@ class KernelBuilder:
                     If d_preloaded=True (for hextet1 when hextet0 used intra_hextet_s), skip D.loads
                     in steps 3-6 (D was loaded via hextet0 tail). This saves 1 cycle from step 6
                     overflow removal (step 6 previously had 4 loads causing 2 bundles, now 2 loads).
+                    If e_preloaded=True (015b), skip E.addr and E.loads in steps 4-9 (E was loaded
+                    via hextet0 tail steps 55-58). Saves 1 cycle at step 9 (4 loads -> 2 loads).
                     saving ~10c per round."""
                     a_loads=s['a_loads']; b_loads=s['b_loads']; c_loads=s['c_loads']; d_loads=s['d_loads']
                     e_loads=s['e_loads']; f_loads=s['f_loads']; g_loads=s['g_loads']; h_loads=s['h_loads']
@@ -1683,14 +1699,25 @@ class KernelBuilder:
                     if d_preloaded:
                         # D loads already done (by hextet0 intra+tail prefetch). Skip D loads.
                         body.extend(a_xor)  # step 3: just a_xor (d_preloaded: D loads done)
-                        # Step 4 (modified): A.hash[0] + B.xor + E.addr (no d_loads!)
-                        body.append(a_hash[0]); body.extend(b_xor); body.extend(e_addr)
-                        # Step 5: A.hash[1:3] + B.hash[0] + C.xor (no d_loads, load engine idle)
-                        body.append(a_hash[1]); body.append(a_hash[2]); body.append(b_hash[0])
-                        body.extend(c_xor)
-                        # Step 6: A.hash[3] + B.hash[1:3] + C.hash[0] + D.xor + E.loads[0:2] + F.addr
-                        body.append(a_hash[3]); body.append(b_hash[1]); body.append(b_hash[2]); body.append(c_hash[0])
-                        body.extend(d_xor); body.extend(e_loads[:2]); body.extend(f_addr)
+                        if e_preloaded:
+                            # E loads also done (by hextet0 tail steps 55-58). Skip E.addr and E.loads.
+                            # Step 4: A.hash[0] + B.xor (no e_addr needed, e already loaded)
+                            body.append(a_hash[0]); body.extend(b_xor)
+                            # Step 5: A.hash[1:3] + B.hash[0] + C.xor (load engine idle)
+                            body.append(a_hash[1]); body.append(a_hash[2]); body.append(b_hash[0])
+                            body.extend(c_xor)
+                            # Step 6: A.hash[3] + B.hash[1:3] + C.hash[0] + D.xor + F.addr (no e_loads!)
+                            body.append(a_hash[3]); body.append(b_hash[1]); body.append(b_hash[2]); body.append(c_hash[0])
+                            body.extend(d_xor); body.extend(f_addr)
+                        else:
+                            # Step 4 (modified): A.hash[0] + B.xor + E.addr (no d_loads!)
+                            body.append(a_hash[0]); body.extend(b_xor); body.extend(e_addr)
+                            # Step 5: A.hash[1:3] + B.hash[0] + C.xor (no d_loads, load engine idle)
+                            body.append(a_hash[1]); body.append(a_hash[2]); body.append(b_hash[0])
+                            body.extend(c_xor)
+                            # Step 6: A.hash[3] + B.hash[1:3] + C.hash[0] + D.xor + E.loads[0:2] + F.addr
+                            body.append(a_hash[3]); body.append(b_hash[1]); body.append(b_hash[2]); body.append(c_hash[0])
+                            body.extend(d_xor); body.extend(e_loads[:2]); body.extend(f_addr)
                     else:
                         body.extend(a_xor); body.extend(d_loads[:2])
                         # Step 4 (modified): A.hash[0] + B.xor + E.addr + D.loads[2:4]
@@ -1703,16 +1730,22 @@ class KernelBuilder:
                         # Step 6: A.hash[3] + B.hash[1:3] + C.hash[0] + D.loads[6:8] + D.xor + E.loads[0:2] + F.addr
                         body.append(a_hash[3]); body.append(b_hash[1]); body.append(b_hash[2]); body.append(c_hash[0])
                         body.extend(d_loads[6:]); body.extend(d_xor); body.extend(e_loads[:2]); body.extend(f_addr)
-                    # Step 7 (modified): A.hash[4] + B.hash[3] + C.hash[1:3] + D.hash[0] + E.load[2:4]
+                    # Step 7 (modified): A.hash[4] + B.hash[3] + C.hash[1:3] + D.hash[0] [+ E.load[2:4] if not e_preloaded]
                     # F.addr moved earlier (step 6), removed from here
                     body.append(a_hash[4]); body.append(b_hash[3]); body.append(c_hash[1]); body.append(c_hash[2]); body.append(d_hash[0])
-                    body.extend(e_loads[2:4])
-                    # Step 8: A.hash[5:7] + B.hash[4] + C.hash[3] + D.hash[1:3] + E.load[4:6]
+                    if not e_preloaded:
+                        body.extend(e_loads[2:4])
+                    # Step 8: A.hash[5:7] + B.hash[4] + C.hash[3] + D.hash[1:3] [+ E.load[4:6] if not e_preloaded]
                     body.append(a_hash[5]); body.append(a_hash[6]); body.append(b_hash[4]); body.append(c_hash[3])
-                    body.append(d_hash[1]); body.append(d_hash[2]); body.extend(e_loads[4:6])
+                    body.append(d_hash[1]); body.append(d_hash[2])
+                    if not e_preloaded:
+                        body.extend(e_loads[4:6])
                     # Step 9: A.hash[7] + B.hash[5:7] + C.hash[4] + D.hash[3] + E.load[6:] + E.xor + F.load[:2]
+                    # KEY SAVINGS (015b): when e_preloaded, e_loads[6:] removed → step 9 goes from 4 loads to 2 loads (1 bundle)
                     body.append(a_hash[7]); body.append(b_hash[5]); body.append(b_hash[6]); body.append(c_hash[4]); body.append(d_hash[3])
-                    body.extend(e_loads[6:]); body.extend(e_xor); body.extend(f_loads[:2])
+                    if not e_preloaded:
+                        body.extend(e_loads[6:])
+                    body.extend(e_xor); body.extend(f_loads[:2])
                     # Step 10: A.hash[8] + B.hash[7] + C.hash[5:7] + D.hash[4] + F.load[2:4] + G.addr
                     body.append(a_hash[8]); body.append(b_hash[7]); body.append(c_hash[5]); body.append(c_hash[6]); body.append(d_hash[4])
                     body.extend(f_loads[2:4]); body.extend(g_addr)
@@ -1918,11 +1951,14 @@ class KernelBuilder:
                         'c_addr': [],            # C addr already in hextet0 body step 3
                         'c_loads': s1['c_loads'][6:8],  # remaining C[6:8] → tail step 59
                         'd_addr': [],            # D addr already in hextet0 body step 3
+                        # 015b: Prefetch E group addr+loads in tail steps 55-58 (otherwise empty in this path)
+                        'e_addr': s1['e_addr'],  # E addr → tail start (alongside A-D addrs)
+                        'e_loads': s1['e_loads'], # E loads → tail steps 55-58 (2 per step, 8 total)
                     }
                     emit_hextet_tail_steps50_63(body, s0, next_s=intra_tail_next_s,
                                                store_inject=store_inject_hex0)
-                    # Emit hextet1 steps 3-49 with D preloaded (skip d_loads in steps 3-6)
-                    emit_hextet_body_steps3_63(body, s1, emit_tail=False, d_preloaded=True)
+                    # Emit hextet1 steps 3-49 with D and E preloaded
+                    emit_hextet_body_steps3_63(body, s1, emit_tail=False, d_preloaded=True, e_preloaded=True)
                 else:
                     emit_hextet_tail_steps50_63(body, s0, next_s=s1,
                                                store_inject=store_inject_hex0)
