@@ -4,17 +4,17 @@
   "target_cycles": 1487,
   "stretch_target": 1363,
   "current_best": {
-    "cycles": 2396,
-    "commit": "367f3d9",
-    "technique": "8pair_parallel_hash_idx_round12",
-    "speedup_over_original_baseline": 61.66
+    "cycles": 2357,
+    "commit": "4eb15e6",
+    "technique": "store_overlap_hextet_tail",
+    "speedup_over_original_baseline": 62.68
   },
   "known_bottlenecks": {
-    "load": "8× load_offset per group → 4 cycles (load×2 slot limit)",
-    "hash": "9 cycles (3× multiply_add + 3× dep-chain×2)",
+    "load": "8\u00d7 load_offset per group \u2192 4 cycles (load\u00d72 slot limit)",
+    "hash": "9 cycles (3\u00d7 multiply_add + 3\u00d7 dep-chain\u00d72)",
     "idx_update": "4 cycles (lsb + offset + idx + bounds_check)",
     "total_per_group": 18,
-    "key_insight": "load 引擎在 hash 阶段 9c 完全空闲 → cross-group pipeline 机会"
+    "key_insight": "load \u5f15\u64ce\u5728 hash \u9636\u6bb5 9c \u5b8c\u5168\u7a7a\u95f2 \u2192 cross-group pipeline \u673a\u4f1a"
   },
   "attempts": [
     {
@@ -22,7 +22,7 @@
       "attempt_id": "001",
       "timestamp": "2026-04-10T15:25:45.118521",
       "technique": "cross_group_pipeline_2way",
-      "reasoning": "当前实现 18c/group 的核心瓶颈是：load 阶段（5c）和 hash 阶段（9c）串行执行，且两者使用完全不同的引擎（load engine vs valu engine）。VLIW 架构允许不同引擎在同一 cycle 并行执行，因此将相邻两组 (A,B) 交错：当 A 在 hash（valu-only, 9c）时，B 同时 load（load engine, 4c）。理论上每对 group 从 36c 降至 ~24c（12c/group），总 cycles ≈ 16轮×16对×24 ≈ 6,144。实现关键：为每个 group 独立分配 addr_tmp/nv_tmp，避免 WAW 冲突；利用 build() 的自动打包逻辑，只需按正确拓扑顺序交错提交 slots。预期从 9,936 降至 ~6,200，改善约 37%。"
+      "reasoning": "\u5f53\u524d\u5b9e\u73b0 18c/group \u7684\u6838\u5fc3\u74f6\u9888\u662f\uff1aload \u9636\u6bb5\uff085c\uff09\u548c hash \u9636\u6bb5\uff089c\uff09\u4e32\u884c\u6267\u884c\uff0c\u4e14\u4e24\u8005\u4f7f\u7528\u5b8c\u5168\u4e0d\u540c\u7684\u5f15\u64ce\uff08load engine vs valu engine\uff09\u3002VLIW \u67b6\u6784\u5141\u8bb8\u4e0d\u540c\u5f15\u64ce\u5728\u540c\u4e00 cycle \u5e76\u884c\u6267\u884c\uff0c\u56e0\u6b64\u5c06\u76f8\u90bb\u4e24\u7ec4 (A,B) \u4ea4\u9519\uff1a\u5f53 A \u5728 hash\uff08valu-only, 9c\uff09\u65f6\uff0cB \u540c\u65f6 load\uff08load engine, 4c\uff09\u3002\u7406\u8bba\u4e0a\u6bcf\u5bf9 group \u4ece 36c \u964d\u81f3 ~24c\uff0812c/group\uff09\uff0c\u603b cycles \u2248 16\u8f6e\u00d716\u5bf9\u00d724 \u2248 6,144\u3002\u5b9e\u73b0\u5173\u952e\uff1a\u4e3a\u6bcf\u4e2a group \u72ec\u7acb\u5206\u914d addr_tmp/nv_tmp\uff0c\u907f\u514d WAW \u51b2\u7a81\uff1b\u5229\u7528 build() \u7684\u81ea\u52a8\u6253\u5305\u903b\u8f91\uff0c\u53ea\u9700\u6309\u6b63\u786e\u62d3\u6251\u987a\u5e8f\u4ea4\u9519\u63d0\u4ea4 slots\u3002\u9884\u671f\u4ece 9,936 \u964d\u81f3 ~6,200\uff0c\u6539\u5584\u7ea6 37%\u3002"
     },
     {
       "type": "generator_started",
@@ -34,7 +34,7 @@
       "type": "generator_checkpoint",
       "attempt_id": "001",
       "timestamp": "2026-04-10T15:30:08.172531",
-      "progress": "完成 per-group scratch 分配和 helper 函数，正在交错循环体"
+      "progress": "\u5b8c\u6210 per-group scratch \u5206\u914d\u548c helper \u51fd\u6570\uff0c\u6b63\u5728\u4ea4\u9519\u5faa\u73af\u4f53"
     },
     {
       "type": "generator_done",
@@ -67,10 +67,10 @@
       ],
       "bottleneck_analysis": {
         "primary_bottleneck": "valu chain: hash computation remains serial within each group; 12 valu slots with 3 multiply_add dependency chains",
-        "load_utilization": "Improved — B group loads overlap A hash phase (2 load slots × ~4 cycles during A hash); still only 2 load slots per cycle limit",
-        "valu_utilization": "Partially improved via 2-way cross-pipeline; hash s1/s3/s5 pairs (2 parallel slots) fill 2 of 6 valu slots, multiply_add uses 1 slot — max ~2-3/6 utilized during hash phase",
-        "theoretical_min_cycles": "hash valu chain: 12 slots with dependencies → min ~8 cycles if all non-dep pairs packed; 8 loads/group ÷ 2 load-slots = 4 cycles; 16 rounds × 32 groups ÷ 2 (paired) × ~12 cycles/pair ≈ 3072 cycles lower bound",
-        "headroom": "6096 → ~3072 theoretical; 2x headroom still available via 4-way pipeline (A-load overlaps C-hash while B-idx overlaps D-addr) or tighter hash interleaving"
+        "load_utilization": "Improved \u2014 B group loads overlap A hash phase (2 load slots \u00d7 ~4 cycles during A hash); still only 2 load slots per cycle limit",
+        "valu_utilization": "Partially improved via 2-way cross-pipeline; hash s1/s3/s5 pairs (2 parallel slots) fill 2 of 6 valu slots, multiply_add uses 1 slot \u2014 max ~2-3/6 utilized during hash phase",
+        "theoretical_min_cycles": "hash valu chain: 12 slots with dependencies \u2192 min ~8 cycles if all non-dep pairs packed; 8 loads/group \u00f7 2 load-slots = 4 cycles; 16 rounds \u00d7 32 groups \u00f7 2 (paired) \u00d7 ~12 cycles/pair \u2248 3072 cycles lower bound",
+        "headroom": "6096 \u2192 ~3072 theoretical; 2x headroom still available via 4-way pipeline (A-load overlaps C-hash while B-idx overlaps D-addr) or tighter hash interleaving"
       },
       "next_round_recommendation": "4-way cross-pipeline (ABCD groups): cycle A.hash + B.load + C.idx + D.addr simultaneously. Also try packing multiply_add with parallel independent valu ops across groups in same bundle to push valu utilization above 3/6."
     },
@@ -87,10 +87,10 @@
       "timestamp": "2026-04-10T15:43:01.578935",
       "technique": "cross_group_pipeline_3way_AND_4way",
       "parallel_plans": [
-        "002a: 3-group incremental — process groups in triples (10 triples + 1 pair), add pair_2 scratch for group C temps, C.load overlaps A.hash window, expected ~5,200 cycles (10c/group)",
-        "002b: 4-group aggressive — process groups in quads (8 quads, 32/4 exact), add pair_2 and pair_3 scratch, A.hash + B.load + C.idx + D.addr all overlap simultaneously, target detailed 20-step interleave schedule, expected ~3,200 cycles (6.5c/group)"
+        "002a: 3-group incremental \u2014 process groups in triples (10 triples + 1 pair), add pair_2 scratch for group C temps, C.load overlaps A.hash window, expected ~5,200 cycles (10c/group)",
+        "002b: 4-group aggressive \u2014 process groups in quads (8 quads, 32/4 exact), add pair_2 and pair_3 scratch, A.hash + B.load + C.idx + D.addr all overlap simultaneously, target detailed 20-step interleave schedule, expected ~3,200 cycles (6.5c/group)"
       ],
-      "reasoning": "Round 1 achieved 6,096 cycles (11.9c/group) via 2-way cross-pipeline where B.load overlaps A.hash. The Evaluator confirmed valu utilization is only 2-3/6 slots during hash, and load engine is idle during A.idx phase (5 cycles). The key insight for Route 2a: during the 9-cycle A.hash window, the load engine is completely idle — injecting C.load (8 slots × 2/cycle = 4 cycles) and C.addr (1 valu slot) costs nothing extra. This turns a 2×12=24c pair into a 3×~10=30c triple. Route 2b goes further: with 4 groups, every engine cycle has work — A.hash (valu), B.load (load), C.idx (valu), D.addr (valu) can all pack into the same VLIW bundle. The 6-valu-slot budget is 1-2+1-2+1=3-5 slots, staying under the limit. 4-way divides 32 groups cleanly (8 quads) with no remainder handling. Theoretical: ~3,072 cycles (Evaluator confirmed). Route 2a is low-risk (incremental change to loop body only), Route 2b is high-reward (near-theoretical minimum) with higher implementation complexity. Both routes add only 2-4 new scratch pair allocations and change only the main loop body structure — the 5 helper functions remain unchanged."
+      "reasoning": "Round 1 achieved 6,096 cycles (11.9c/group) via 2-way cross-pipeline where B.load overlaps A.hash. The Evaluator confirmed valu utilization is only 2-3/6 slots during hash, and load engine is idle during A.idx phase (5 cycles). The key insight for Route 2a: during the 9-cycle A.hash window, the load engine is completely idle \u2014 injecting C.load (8 slots \u00d7 2/cycle = 4 cycles) and C.addr (1 valu slot) costs nothing extra. This turns a 2\u00d712=24c pair into a 3\u00d7~10=30c triple. Route 2b goes further: with 4 groups, every engine cycle has work \u2014 A.hash (valu), B.load (load), C.idx (valu), D.addr (valu) can all pack into the same VLIW bundle. The 6-valu-slot budget is 1-2+1-2+1=3-5 slots, staying under the limit. 4-way divides 32 groups cleanly (8 quads) with no remainder handling. Theoretical: ~3,072 cycles (Evaluator confirmed). Route 2a is low-risk (incremental change to loop body only), Route 2b is high-reward (near-theoretical minimum) with higher implementation complexity. Both routes add only 2-4 new scratch pair allocations and change only the main loop body structure \u2014 the 5 helper functions remain unchanged."
     },
     {
       "type": "generator_started",
@@ -174,7 +174,7 @@
       "attempt_id": "003",
       "timestamp": "2026-04-10T16:23:51.737839",
       "technique": "cross_group_pipeline_8way_plus_idx_opt",
-      "reasoning": "当前 4-group pipeline 在 32.6 cycles/quad 下运行，详细 bundle 分析显示实际已接近理论值（~32 bundles/quad vs 31 理论最小）。主要 overhead 来自两处：(1) 每个 quad 的 tail：D.idx 串行链（5 steps）产生 bundles 27-31，每个只有 1-2 valu slots，浪费大量 capacity；(2) 每个 quad 的 startup：A.addr + A.load 开始之前 B-D 未就绪。8-group octet pipeline 通过 E-H 组填充这些空洞来解决：E.addr/E.load 在 A-D hash window（steps 4-18）期间进行，H.idx tail 与 D.idx tail 合并到同一个 diagonal 中。结构上：32 groups / 8 = 4 octets，16 rounds × 4 = 64 octets。额外 scratch：4 pairs × 4 × 8 = 128 words，总计 1473 < 1536。预期 cycles：~2200-2500（当前 4176 的 40-47% 降幅）。idx_update 链深度为 5（lsb→offset→new_idx→cmp→idx 全为真 RAW），无法通过指令重排减少；cross-round 流水线同样被 idx→addr 的 RAW 依赖阻断。因此 8-group octet pipeline 是本轮唯一有效的大幅优化方向。"
+      "reasoning": "\u5f53\u524d 4-group pipeline \u5728 32.6 cycles/quad \u4e0b\u8fd0\u884c\uff0c\u8be6\u7ec6 bundle \u5206\u6790\u663e\u793a\u5b9e\u9645\u5df2\u63a5\u8fd1\u7406\u8bba\u503c\uff08~32 bundles/quad vs 31 \u7406\u8bba\u6700\u5c0f\uff09\u3002\u4e3b\u8981 overhead \u6765\u81ea\u4e24\u5904\uff1a(1) \u6bcf\u4e2a quad \u7684 tail\uff1aD.idx \u4e32\u884c\u94fe\uff085 steps\uff09\u4ea7\u751f bundles 27-31\uff0c\u6bcf\u4e2a\u53ea\u6709 1-2 valu slots\uff0c\u6d6a\u8d39\u5927\u91cf capacity\uff1b(2) \u6bcf\u4e2a quad \u7684 startup\uff1aA.addr + A.load \u5f00\u59cb\u4e4b\u524d B-D \u672a\u5c31\u7eea\u30028-group octet pipeline \u901a\u8fc7 E-H \u7ec4\u586b\u5145\u8fd9\u4e9b\u7a7a\u6d1e\u6765\u89e3\u51b3\uff1aE.addr/E.load \u5728 A-D hash window\uff08steps 4-18\uff09\u671f\u95f4\u8fdb\u884c\uff0cH.idx tail \u4e0e D.idx tail \u5408\u5e76\u5230\u540c\u4e00\u4e2a diagonal \u4e2d\u3002\u7ed3\u6784\u4e0a\uff1a32 groups / 8 = 4 octets\uff0c16 rounds \u00d7 4 = 64 octets\u3002\u989d\u5916 scratch\uff1a4 pairs \u00d7 4 \u00d7 8 = 128 words\uff0c\u603b\u8ba1 1473 < 1536\u3002\u9884\u671f cycles\uff1a~2200-2500\uff08\u5f53\u524d 4176 \u7684 40-47% \u964d\u5e45\uff09\u3002idx_update \u94fe\u6df1\u5ea6\u4e3a 5\uff08lsb\u2192offset\u2192new_idx\u2192cmp\u2192idx \u5168\u4e3a\u771f RAW\uff09\uff0c\u65e0\u6cd5\u901a\u8fc7\u6307\u4ee4\u91cd\u6392\u51cf\u5c11\uff1bcross-round \u6d41\u6c34\u7ebf\u540c\u6837\u88ab idx\u2192addr \u7684 RAW \u4f9d\u8d56\u963b\u65ad\u3002\u56e0\u6b64 8-group octet pipeline \u662f\u672c\u8f6e\u552f\u4e00\u6709\u6548\u7684\u5927\u5e45\u4f18\u5316\u65b9\u5411\u3002"
     },
     {
       "type": "generator_started",
@@ -229,11 +229,11 @@
       "attempt_id": "004",
       "timestamp": "2026-04-10T17:30:00.000000",
       "technique": "combined_16group_pipeline_plus_early_round_special_cases_plus_setup_packing",
-      "reasoning": "After careful verification: ALL 256 elements start with idx=0 (confirmed in frozen_problem.py Input.generate()). Tree height=10, n_nodes=2047. The period is exactly 11 rounds: after round 10, all leaf indices produce 2*idx+(1or2)>=2047, so ALL reset to 0. With rounds=16: rounds 0,11 have idx=0; rounds 1,12 have idx∈{1,2}; rounds 2,13 have idx∈{3,4,5,6}; rounds 3,14 have idx∈{7..14}; rounds 4-10,15 are normal. THREE parallel optimizations: (A) Setup packing: 12 vbroadcasts packed 6/cycle saves ~90 cycles from 141-cycle setup. (B) 16-group pipeline: extends 8-group octet to 16-group, better load/valu interleaving, targets ~67 cycles per 16-group batch vs current 98 cycles (2×49) for same 16 groups → estimates ~2285 total. (C) Early-round special-casing for rounds 0,11 (1 load + shared vbroadcast + 32 xor = ~104 cycles vs 196), rounds 1,12 (2 loads + 32 vselect-on-idx + hash + idx = ~140 cycles), rounds 2,13 (4 loads + 64 vselect + hash + idx = ~160 cycles). Combined estimate: ~1815 cycles. If still above 1487, extend to 32-group pipeline. Key correctness constraint: for type_1 vselect (round 1,12), the vselect condition is on CURRENT idx (not hashed val) — idx∈{1,2}, so lsb of idx=1 selects node[1], lsb of idx=0 selects node[2]. Two parallel tracks: (004a) 16-group pipeline + setup packing; (004b) early-round special-cases on existing 8-group + setup packing. Measure both, then combine winner.",
+      "reasoning": "After careful verification: ALL 256 elements start with idx=0 (confirmed in frozen_problem.py Input.generate()). Tree height=10, n_nodes=2047. The period is exactly 11 rounds: after round 10, all leaf indices produce 2*idx+(1or2)>=2047, so ALL reset to 0. With rounds=16: rounds 0,11 have idx=0; rounds 1,12 have idx\u2208{1,2}; rounds 2,13 have idx\u2208{3,4,5,6}; rounds 3,14 have idx\u2208{7..14}; rounds 4-10,15 are normal. THREE parallel optimizations: (A) Setup packing: 12 vbroadcasts packed 6/cycle saves ~90 cycles from 141-cycle setup. (B) 16-group pipeline: extends 8-group octet to 16-group, better load/valu interleaving, targets ~67 cycles per 16-group batch vs current 98 cycles (2\u00d749) for same 16 groups \u2192 estimates ~2285 total. (C) Early-round special-casing for rounds 0,11 (1 load + shared vbroadcast + 32 xor = ~104 cycles vs 196), rounds 1,12 (2 loads + 32 vselect-on-idx + hash + idx = ~140 cycles), rounds 2,13 (4 loads + 64 vselect + hash + idx = ~160 cycles). Combined estimate: ~1815 cycles. If still above 1487, extend to 32-group pipeline. Key correctness constraint: for type_1 vselect (round 1,12), the vselect condition is on CURRENT idx (not hashed val) \u2014 idx\u2208{1,2}, so lsb of idx=1 selects node[1], lsb of idx=0 selects node[2]. Two parallel tracks: (004a) 16-group pipeline + setup packing; (004b) early-round special-cases on existing 8-group + setup packing. Measure both, then combine winner.",
       "parallel_plans": [
-        "004a: 16-group pipeline + setup packing — expected ~2285 cycles",
-        "004b: early-round special-cases (rounds 0,1,2,11,12,13) on 8-group + setup packing — expected ~2600 cycles",
-        "004c (if needed): combine 16-group + special-cases — expected ~1815 cycles"
+        "004a: 16-group pipeline + setup packing \u2014 expected ~2285 cycles",
+        "004b: early-round special-cases (rounds 0,1,2,11,12,13) on 8-group + setup packing \u2014 expected ~2600 cycles",
+        "004c (if needed): combine 16-group + special-cases \u2014 expected ~1815 cycles"
       ],
       "abort_threshold": 3400,
       "success_threshold": 3177,
@@ -273,7 +273,7 @@
       "cycles_before": 3344,
       "cycles_after": null,
       "passed": false,
-      "reject_reason": "correctness failure: vsel4_nv_hi and vsel4_b_in_lo are SHARED scratch across all 8 groups in octet, causing WAW corruption — d_vsx4[2] overwrites vsel4_nv_hi before d_vsx4[4] reads it when e_vsx4[2] interleaves. Round mod 2 (round_mod==2) special-casing broken.",
+      "reject_reason": "correctness failure: vsel4_nv_hi and vsel4_b_in_lo are SHARED scratch across all 8 groups in octet, causing WAW corruption \u2014 d_vsx4[2] overwrites vsel4_nv_hi before d_vsx4[4] reads it when e_vsx4[2] interleaves. Round mod 2 (round_mod==2) special-casing broken.",
       "selected_winner": false
     },
     {
@@ -284,7 +284,7 @@
       "cycles_after": 3132,
       "improvement_pct": 6.34,
       "passed": true,
-      "threshold_met": "test_round4_sonnet (< 3344*0.95=3177 → 3132 PASS)",
+      "threshold_met": "test_round4_sonnet (< 3344*0.95=3177 \u2192 3132 PASS)",
       "bottleneck_analysis": {
         "current_cycles_per_hextet": 97.9,
         "target_cycles_per_hextet": 46.5,
@@ -345,7 +345,7 @@
       "thresholds_passed": [
         "test_kernel_correctness (< 18532)",
         "test_round4_sonnet (< 3344)",
-        "test_round4_combined (< 2975 → 2966 PASS)"
+        "test_round4_combined (< 2975 \u2192 2966 PASS)"
       ],
       "key_optimizations": [
         "round_mod==0 (rounds 0,11): broadcast single forest_values[0], skip 32x8=256 load_offsets",
@@ -412,7 +412,7 @@
       "type": "generator_checkpoint",
       "attempt_id": "006",
       "timestamp": "2026-04-10T20:42:19.502982",
-      "progress": "Optimization 2 (mod2 4-node arith) done: 2966→2908 cycles. Starting Opt 1 (mod1 valu vselect).",
+      "progress": "Optimization 2 (mod2 4-node arith) done: 2966\u21922908 cycles. Starting Opt 1 (mod1 valu vselect).",
       "cycles_so_far": 2908
     },
     {
@@ -464,7 +464,7 @@
         "normal_load_bottleneck": "128 load_offset / 2 slots = 64 cycles/hextet (theoretical min)",
         "normal_overhead_per_hextet": 28,
         "normal_fraction": "63.3% of total cycles",
-        "path_to_1487": "Normal rounds at 1840 (63%) dominate; need reduction from 184→42 per round to hit target with current special round costs – nearly impossible by load physics. Real path: combine special-casing more rounds (mod3,mod4) + hextet tail optimization + possibly setup reduction.",
+        "path_to_1487": "Normal rounds at 1840 (63%) dominate; need reduction from 184\u219242 per round to hit target with current special round costs \u2013 nearly impossible by load physics. Real path: combine special-casing more rounds (mod3,mod4) + hextet tail optimization + possibly setup reduction.",
         "hextet_tail_waste": "~5-9 cycles at tail (P group finishing while others done)",
         "forest_precache_blocked": "Scratch space insufficient: need 1023 forest vals + 791 min scratch = 1814 > 1536 limit"
       },
@@ -580,7 +580,7 @@
         "setup_rounds1": 314,
         "path_to_1487": "Would need 1487 from 2668 = reduce by 1181 cycles. Normal rounds: 10x32=320 possible. Special rounds: mod0+11=2x~50=100. Remaining gap 1181-420=761 not achievable with current architecture. Need fundamentally different approach - possibly larger hextet groups (32-group) or reducing hash chain depth."
       },
-      "round8_recommendation": "Focus on reducing normal hextet from 80→64 cycles. The load bottleneck is 64 cycles for 128 load_offset ops. Current 80c vs 64c theoretical = 16 cycles overhead per hextet. Root cause: VALU bottleneck in hash diagonal leaves load engine idle at step boundaries. Counter-strategy: compress hash chain further OR interleave more groups. Scratch has 105 words remaining - enough for 13 more VLEN=8 scratch vectors. Most viable: 32-group hextet (3 hextets per round at 64c each = 192c, but saves vs 2x80=160 for 2 hextets... actually worse). Alternative: reduce addr overhead - addr is 1 valu per group, 16 per hextet = 3 cycles; can we precompute? Another option: fuse the two hextets into one 32-group hextet to benefit from more overlap. Expected 007b result was 2,668 (same), suggesting this inter-hextet overlap is the current state-of-art without deeper restructuring."
+      "round8_recommendation": "Focus on reducing normal hextet from 80\u219264 cycles. The load bottleneck is 64 cycles for 128 load_offset ops. Current 80c vs 64c theoretical = 16 cycles overhead per hextet. Root cause: VALU bottleneck in hash diagonal leaves load engine idle at step boundaries. Counter-strategy: compress hash chain further OR interleave more groups. Scratch has 105 words remaining - enough for 13 more VLEN=8 scratch vectors. Most viable: 32-group hextet (3 hextets per round at 64c each = 192c, but saves vs 2x80=160 for 2 hextets... actually worse). Alternative: reduce addr overhead - addr is 1 valu per group, 16 per hextet = 3 cycles; can we precompute? Another option: fuse the two hextets into one 32-group hextet to benefit from more overlap. Expected 007b result was 2,668 (same), suggesting this inter-hextet overlap is the current state-of-art without deeper restructuring."
     },
     {
       "type": "merged",
@@ -653,7 +653,7 @@
         "note": "1689c valu floor (10134 main-loop valu ops / 6) + 120c setup = 1809c. Load (1287c) is NOT the bottleneck - valu is.",
         "current_waste": 829,
         "waste_breakdown": {
-          "special_rounds_nearly_zero_load": "rounds 0-2 use 430c with <6 total load ops → load engine idle 424c",
+          "special_rounds_nearly_zero_load": "rounds 0-2 use 430c with <6 total load ops \u2192 load engine idle 424c",
           "valu_dep_chain_overhead": "10134 valu ops need 1689c minimum but take 2225c actual (1.32x overhead)",
           "valu_idle_during_loads": "297 cycles post-setup have zero valu ops (11.8%), 225 of those are load-active",
           "per_hextet_gap": "noload hextets: 62c actual vs 48c theoretical (1.31x overhead from dep chains)"
@@ -712,14 +712,14 @@
       "improvement_pct": -273.9,
       "passed": false,
       "reject_reason": "massive regression: 9864 vs 2638. Group-major emission fails because build() is a greedy left-to-right packer - it cannot interleave group 0 round 3 loads with group 1-31 round 0 valu. The correct diagonal scheduling requires emitting slots from DIFFERENT groups at DIFFERENT rounds SIMULTANEOUSLY (true matrix diagonal traversal, not column-major).",
-      "key_learning": "Correct diagonal = for d in range(32+16-1): for g in diagonal d: emit per_group_round_slots(g, d-g). This ensures group g round r and group g+1 round r-1 are adjacent in slot list → packer sees them together."
+      "key_learning": "Correct diagonal = for d in range(32+16-1): for g in diagonal d: emit per_group_round_slots(g, d-g). This ensures group g round r and group g+1 round r-1 are adjacent in slot list \u2192 packer sees them together."
     },
     {
       "type": "planner_decision",
       "attempt_id": "010",
       "timestamp": "2026-04-10T17:14:56.001019",
       "technique": "per_group_addr_scalars_plus_xor_hash_pipeline",
-      "reasoning": "Round 9 root cause: group-major diagonal emission broke pair-safety. Groups g=0 and g=4 share pair p=g%4=0. When g=4 at round d-4 and g=0 at round d appear adjacent in the diagonal slot stream, their hash operations both write/read t1_pair[0], causing data corruption (9864 cycles). True diagonal requires per-group pair scratch = 32x4x8=1024 extra words; budget only has 105. Diagonal scheduling is NOT viable.\n\nTrue remaining inefficiencies:\n1. INIT SECTION (120 cycles): 32 groups x (alu+vload+alu+vload) through 2 shared addr_scalar registers. WAW on shared scalar forces ~64 cycles of serial execution (vs 16-cycle theoretical minimum for 32 vloads at 2/cycle). \n2. STORE SECTION (64 cycles): same pattern, 32 groups serialized through shared addr_scalar/addr_scalar2.\n3. NOLOAD HEXTET XOR: 16 xors emitted in bulk (3 cycles) before any hash. Group A.xor completes cycle 1; A.hash[0] could start cycle 2 while later groups fill xor slots.\n\nFix 1+2: allocate per-group addr_idx_g[g] and addr_val_g[g] scalars (64 words, within 105-word budget). Emit all addr alu ops first (no WAW conflicts -> 3 bundles), then interleave vloads/vstores (2/cycle minimum). Saving: ~42c init + ~28c store = ~70c total.\n\nFix 3: reorder xor+hash emission in emit_hextet_noload to pipeline A.hash[0] at slot 7 (after first 6 xors). Saving: ~1-2c per hextet x 4 calls = ~16c.\n\nExpected result: 2638 - 70 - 16 ≈ 2552c (well below 2600 success threshold).",
+      "reasoning": "Round 9 root cause: group-major diagonal emission broke pair-safety. Groups g=0 and g=4 share pair p=g%4=0. When g=4 at round d-4 and g=0 at round d appear adjacent in the diagonal slot stream, their hash operations both write/read t1_pair[0], causing data corruption (9864 cycles). True diagonal requires per-group pair scratch = 32x4x8=1024 extra words; budget only has 105. Diagonal scheduling is NOT viable.\n\nTrue remaining inefficiencies:\n1. INIT SECTION (120 cycles): 32 groups x (alu+vload+alu+vload) through 2 shared addr_scalar registers. WAW on shared scalar forces ~64 cycles of serial execution (vs 16-cycle theoretical minimum for 32 vloads at 2/cycle). \n2. STORE SECTION (64 cycles): same pattern, 32 groups serialized through shared addr_scalar/addr_scalar2.\n3. NOLOAD HEXTET XOR: 16 xors emitted in bulk (3 cycles) before any hash. Group A.xor completes cycle 1; A.hash[0] could start cycle 2 while later groups fill xor slots.\n\nFix 1+2: allocate per-group addr_idx_g[g] and addr_val_g[g] scalars (64 words, within 105-word budget). Emit all addr alu ops first (no WAW conflicts -> 3 bundles), then interleave vloads/vstores (2/cycle minimum). Saving: ~42c init + ~28c store = ~70c total.\n\nFix 3: reorder xor+hash emission in emit_hextet_noload to pipeline A.hash[0] at slot 7 (after first 6 xors). Saving: ~1-2c per hextet x 4 calls = ~16c.\n\nExpected result: 2638 - 70 - 16 \u2248 2552c (well below 2600 success threshold).",
       "expected_cycles": 2549,
       "success_threshold": 2610,
       "abort_threshold": 2650,
@@ -856,7 +856,7 @@
       "technique": "divergent_exploration_3way",
       "trigger": "plateau: Round 8-11 all < 2.2%",
       "vm_study": "Planner read frozen_problem.py and perf_takehome.py in full",
-      "reasoning": "Three independent insights from source analysis:\n\n1. DEAD SCRATCH (Direction A): lsb_tmp_pair[0..3] and cmp_tmp_pair[0..3] are allocated (64 words) but NEVER USED — Round 011 replaced them with addr_tmp_g[g] reuse. These 64 freed words enable doubling hash temp pairs from 4 to 8, eliminating pair contention between groups A-D and E-H within each hextet. Hash phase serial depth cuts from 40 to 20 cycles per hextet.\n\n2. LOAD WASTE (Direction B): Round 010 trace showed 52.3% LOAD utilization — load engine is idle 47.7% of cycles despite being the throughput bottleneck. With 128 load_offset ops per hextet needing 64 cycles at 2/cycle, but taking ~122 cycles, there are ~58 wasted load-slot-cycles per hextet. Load ops from different groups are always independent, so a bulk-addr-then-bulk-load emission order should saturate the load engine.\n\n3. TREE DEPTH PATTERN (Direction C): The tree height=7 means all depth-7 elements wrap to root after traversal. Round 8 is IDENTICAL to round 0 in tree access pattern, rounds 9,10 identical to 1,2. But code uses rnd%11 not rnd%8, sending rounds 8,9,10 down the slow full-load path. Fix this AND add round 3 special case: round 3 always accesses exactly 8 nodes (7-14 = VLEN), enabling a single vload instruction to fetch all needed values.\n\nMost promising: Direction A (doubled pairs) — directly attacks the identified serialization bottleneck with a concrete mechanism. Direction B (bulk load) directly attacks the measured 52.3% LOAD waste."
+      "reasoning": "Three independent insights from source analysis:\n\n1. DEAD SCRATCH (Direction A): lsb_tmp_pair[0..3] and cmp_tmp_pair[0..3] are allocated (64 words) but NEVER USED \u2014 Round 011 replaced them with addr_tmp_g[g] reuse. These 64 freed words enable doubling hash temp pairs from 4 to 8, eliminating pair contention between groups A-D and E-H within each hextet. Hash phase serial depth cuts from 40 to 20 cycles per hextet.\n\n2. LOAD WASTE (Direction B): Round 010 trace showed 52.3% LOAD utilization \u2014 load engine is idle 47.7% of cycles despite being the throughput bottleneck. With 128 load_offset ops per hextet needing 64 cycles at 2/cycle, but taking ~122 cycles, there are ~58 wasted load-slot-cycles per hextet. Load ops from different groups are always independent, so a bulk-addr-then-bulk-load emission order should saturate the load engine.\n\n3. TREE DEPTH PATTERN (Direction C): The tree height=7 means all depth-7 elements wrap to root after traversal. Round 8 is IDENTICAL to round 0 in tree access pattern, rounds 9,10 identical to 1,2. But code uses rnd%11 not rnd%8, sending rounds 8,9,10 down the slow full-load path. Fix this AND add round 3 special case: round 3 always accesses exactly 8 nodes (7-14 = VLEN), enabling a single vload instruction to fetch all needed values.\n\nMost promising: Direction A (doubled pairs) \u2014 directly attacks the identified serialization bottleneck with a concrete mechanism. Direction B (bulk load) directly attacks the measured 52.3% LOAD waste."
     },
     {
       "type": "generator_started",
@@ -919,7 +919,7 @@
       "cycles_after": 2537,
       "improvement_pct": 0.7,
       "passed": false,
-      "unique_contribution": "E-loads 提前注入 + mod1 setup inline，实测 2537 cycles",
+      "unique_contribution": "E-loads \u63d0\u524d\u6ce8\u5165 + mod1 setup inline\uff0c\u5b9e\u6d4b 2537 cycles",
       "decision": "REJECT (012a better)"
     },
     {
@@ -930,7 +930,7 @@
       "cycles_after": 2521,
       "improvement_pct": 1.33,
       "passed": false,
-      "unique_contribution": "arith4 path disabled (round_mod==2 and False), 实测 2521 cycles",
+      "unique_contribution": "arith4 path disabled (round_mod==2 and False), \u5b9e\u6d4b 2521 cycles",
       "decision": "REJECT (arith4 disable actually slower than 012a which keeps arith4)"
     },
     {
@@ -975,12 +975,12 @@
             "avg_util_pct": 0.1
           }
         },
-        "bottleneck": "valu (70.6% utilization, 355 idle cycles vs 1044 load idle) — valu still dominant",
+        "bottleneck": "valu (70.6% utilization, 355 idle cycles vs 1044 load idle) \u2014 valu still dominant",
         "fusion_decision": "No fusion needed: 012c disabled arith4 (round_mod==2 and False) which made it slower (2521 vs 2396). 012a keeps arith4 active and wins."
       },
-      "unique_contribution": "8-pair 并行 hash+idx，parallel octet 重构，2555→2396 cycles",
+      "unique_contribution": "8-pair \u5e76\u884c hash+idx\uff0cparallel octet \u91cd\u6784\uff0c2555\u21922396 cycles",
       "selected_winner": true,
-      "decision": "ACCEPT — merged as 367f3d9"
+      "decision": "ACCEPT \u2014 merged as 367f3d9"
     },
     {
       "type": "merged",
@@ -989,6 +989,218 @@
       "commit": "367f3d9",
       "new_best": 2396,
       "speedup_over_original_baseline": 61.66
+    },
+    {
+      "type": "planner_decision",
+      "attempt_id": "013",
+      "timestamp": "2026-04-11T21:12:01.448657",
+      "technique": "cross_round_prefetch_during_special_rounds_and_store_addr_elim",
+      "reasoning": "Round 12a trace: load=56.3% util (1044 idle cycles), valu=70.6% (355 idle), alu=0.5% (2380 idle).\n\nPRIMARY DIRECTION: Exploit fixed-address prefetch windows in special rounds.\n- Rounds mod0 (round 0 and 11): ~63 cycles each, load engine completely idle. These are broadcast-xor-hash-idx rounds with NO memory loads.\n- Round mod1 (round 1, 12): needs nodes[1] and nodes[2] from tree. Addresses = forest_values_p+1 and +2. INDEPENDENT of any computed idx values.\n- Round mod2 (round 2, 13): needs nodes[3..6]. Addresses = forest_values_p+3..+6. Also independent of computed idx.\n- Therefore: during mod0 round 0's 63 idle load cycles, we can use alu (address arithmetic) + load (node fetches) to prefetch nodes 1,2 for round 1 AND nodes 3-6 for round 2 -- zero cycle cost since alu and load are both completely idle.\n- Same applies during mod0 round 11: prefetch for rounds 12 and 13 (if rounds >= 14).\n- This eliminates the entire setup overhead of mod1 and mod2 rounds (currently 5-6 cycles each for alu addr + load + broadcast setup).\n\nSECONDARY DIRECTION: Store phase address redundancy.\n- addr_idx_g[g] = inp_indices_p + g*VLEN is computed during init and never overwritten in the main loop.\n- The store phase recomputes these 64 alu ops redundantly. Eliminating them saves ~5-6 cycles.\n\nREJECTED DIRECTION: Group-major diagonal.\n- ROUND_PLAN_9.json proposed group-major ordering claiming packer would interleave group 0 loads with groups 1-31 valu ops.\n- This is WRONG. build() is a single-pass greedy packer. Group-major emission means groups 1-31 round 0-2 valu ops are emitted AND packed into bundles BEFORE group 0 round 3 loads appear. Packer cannot retroactively fill those bundles. Round 9 result of 9864 cycles confirms this catastrophic failure.\n- The new ROUND_PLAN_9 repeats the same analysis error.\n\nALU UTILIZATION NOTE: ALU (12 slots/cycle) is almost entirely idle. The address arithmetic for special round setup (normally done with alu in 1 bundle) can be injected into the tail/idle phases of preceding rounds at zero cost. valu ops are already vectors so they cannot move to alu.",
+      "trace_basis": "Round 12a: load 56.3% util, 1044 idle cycles; valu 70.6% util, 355 idle cycles; alu 0.5% util, 2380 idle cycles",
+      "special_rounds_analysis": {
+        "mod0_rounds": [
+          0,
+          11
+        ],
+        "mod1_rounds": [
+          1,
+          12
+        ],
+        "mod2_rounds": [
+          2,
+          13
+        ],
+        "fixed_addresses": "mod1 needs nodes[1,2] at forest_values_p+1..+2; mod2 needs nodes[3..6] at forest_values_p+3..+6",
+        "data_dependency_free": true,
+        "estimated_savings": "~12-20 cycles from prefetch + ~5-6 cycles from store addr elim = ~17-26 cycles total"
+      }
+    },
+    {
+      "type": "generator_started",
+      "attempt_id": "013",
+      "timestamp": "2026-04-11T21:13:43.967810",
+      "worktree": ".claude/worktrees/attempt-013"
+    },
+    {
+      "type": "generator_done",
+      "attempt_id": "013",
+      "timestamp": "2026-04-11T21:27:16.907867",
+      "worktree": ".claude/worktrees/attempt-013",
+      "self_reported_cycles": 2385,
+      "cycles_before": 2396,
+      "improvement_pct": 0.46,
+      "status": "completed"
+    },
+    {
+      "type": "evaluator_result",
+      "attempt_id": "013",
+      "timestamp": "2026-04-11T21:30:05.946378",
+      "cycles_before": 2396,
+      "cycles_after": 2385,
+      "improvement_pct": 0.46,
+      "passed": true,
+      "acceptance_reason": "small positive improvement accepted (11 cycles, 0.46%)",
+      "factual_analysis": {
+        "alu": {
+          "slots_used": 76,
+          "active_cycles": 8,
+          "idle_cycles": 2377,
+          "avg_util_pct": 0.3
+        },
+        "valu": {
+          "slots_used": 10150,
+          "active_cycles": 2037,
+          "idle_cycles": 348,
+          "avg_util_pct": 70.9
+        },
+        "load": {
+          "slots_used": 2700,
+          "active_cycles": 1352,
+          "idle_cycles": 1033,
+          "avg_util_pct": 56.6
+        },
+        "store": {
+          "slots_used": 64,
+          "active_cycles": 32,
+          "idle_cycles": 2353,
+          "avg_util_pct": 1.3
+        },
+        "flow": {
+          "slots_used": 2,
+          "active_cycles": 2,
+          "idle_cycles": 2383,
+          "avg_util_pct": 0.1
+        }
+      },
+      "primary_bottleneck": "load (1033 idle cycles, 56.6% utilization) and valu (348 idle cycles, 70.9% utilization)"
+    },
+    {
+      "type": "merged",
+      "attempt_id": "013",
+      "timestamp": "2026-04-11T21:30:05.946389",
+      "commit": "2c9d260",
+      "new_best": 2385
+    },
+    {
+      "type": "planner_decision",
+      "attempt_id": "014",
+      "timestamp": "2026-04-11T22:15:00.000000",
+      "technique": "diversified_exploration_load_overlap_scratch_cache_hash_reduction",
+      "reasoning": "Round 13 trace: load 56.6% util (1033 idle), valu 70.9% (348 idle), alu 0.3% (2377 idle). Deep analysis reveals: load engine is at 99.9% saturation WHEN active (2700 slots / 1352 active cycles \u00d7 2 = 99.9%). The 1033 idle cycles are structurally forced -- they occur during hash+idx phases when no address for next-group load is yet known. Similarly, the 348 valu idle cycles occur during load-active phases where only 1 XOR/group occupies the valu. The current 16-group hextet pipeline is theoretically near-optimal for the present algorithm structure. Breaking through requires either: (A) extending the cross-round prefetch to cover more groups (A-H instead of A-D) in hextet tails, reducing startup overhead of next round -- load engine is idle for ~14 cycles in hextet1 tail, currently only 24/28 slots filled; (B) investigating whether tree nodes can be partially cached in scratch (185 words free), converting some load_offset ops to free valu operand reads; (C) exploring whether the hash or idx-update dependency chain can be shortened. Three parallel generators explore these mutually distinct directions. Diversification mode triggered by plateau (3 rounds with <3% improvement: 0.46%, 3.6%, 6.2%).",
+      "parallel_attempts": [
+        "014a",
+        "014b",
+        "014c"
+      ],
+      "diversification_mode": true,
+      "trace_basis": "Round 13: load.idle=1033 (56.6% util, 2700 slots / 1352 active_cycles), valu.idle=348 (70.9%, 10150 slots / 2037 active_cycles), alu.idle=2377",
+      "load_analysis": "load_slots_used=2700, load_max_possible=1352*2=2704. Load engine nearly perfectly saturated when active. Idle cycles are structurally unavoidable under current algorithm -- they are hash+idx cycles with no pending loads.",
+      "valu_analysis": "valu_slots_used=10150, valu_active_cycles=2037, avg=4.98/cycle vs max 6. Gap=~2078 slot-opportunities. Occurs during early pipeline stages where load+valu overlap but only 1 xor per group per load phase.",
+      "estimated_potential": "014a: ~30-50 cycles if 4 more groups prefetched per round \u00d7 9 normal rounds; 014b: variable depending on how many loads can be eliminated; 014c: uncertain, hash chain depth is fundamental"
+    },
+    {
+      "type": "generator_started",
+      "attempt_id": "014a",
+      "timestamp": "2026-04-11T22:20:00.000000",
+      "worktree": "/Users/wanglang3/code/original_performance_takehome/.claude/worktrees/attempt-014a"
+    },
+    {
+      "type": "generator_started",
+      "attempt_id": "014b",
+      "timestamp": "2026-04-11T22:25:00.000000",
+      "worktree": "/Users/wanglang3/code/original_performance_takehome/.claude/worktrees/attempt-014b"
+    },
+    {
+      "type": "generator_started",
+      "attempt_id": "014c",
+      "timestamp": "2026-04-11T23:00:00.000000",
+      "worktree": "/Users/wanglang3/code/original_performance_takehome/.claude/worktrees/attempt-014c"
+    },
+    {
+      "type": "generator_done",
+      "attempt_id": "014c",
+      "timestamp": "2026-04-11T23:45:00.000000",
+      "worktree": "/Users/wanglang3/code/original_performance_takehome/.claude/worktrees/attempt-014c",
+      "self_reported_cycles": 2357,
+      "cycles_before": 2385,
+      "improvement_pct": 1.17,
+      "status": "completed"
+    },
+    {
+      "type": "generator_done",
+      "attempt_id": "014b",
+      "timestamp": "2026-04-11T23:10:00.000000",
+      "worktree": "/Users/wanglang3/code/original_performance_takehome/.claude/worktrees/attempt-014b",
+      "self_reported_cycles": 2375,
+      "cycles_before": 2385,
+      "improvement_pct": 0.42,
+      "status": "completed"
+    },
+    {
+      "type": "generator_done",
+      "attempt_id": "014a",
+      "timestamp": "2026-04-11T23:55:00.000000",
+      "worktree": "/Users/wanglang3/code/original_performance_takehome/.claude/worktrees/attempt-014a",
+      "self_reported_cycles": 2373,
+      "cycles_before": 2385,
+      "improvement_pct": 0.50,
+      "status": "completed"
+    },
+    {
+      "type": "evaluator_result",
+      "attempt_id": "014",
+      "timestamp": "2026-04-12T00:10:00.000000",
+      "candidates": {
+        "014a": {"cycles": 2373, "improvement_pct": 0.50, "accepted": false},
+        "014b": {"cycles": 2375, "improvement_pct": 0.42, "accepted": false},
+        "014c": {"cycles": 2357, "improvement_pct": 1.17, "accepted": true}
+      },
+      "cycles_before": 2385,
+      "cycles_after": 2357,
+      "improvement_pct": 1.17,
+      "winner": "014c",
+      "passed": true,
+      "acceptance_reason": "014c achieved 2357 cycles (1.17% improvement over 2385). All three candidates independently verified by Evaluator. Generator self-reports confirmed accurate. Winner accepted on positive improvement basis.",
+      "factual_analysis": {
+        "alu": {
+          "slots_used": 76,
+          "active_cycles": 8,
+          "idle_cycles": 2349,
+          "avg_util_pct": 0.3
+        },
+        "valu": {
+          "slots_used": 10150,
+          "active_cycles": 2038,
+          "idle_cycles": 319,
+          "avg_util_pct": 71.8
+        },
+        "load": {
+          "slots_used": 2700,
+          "active_cycles": 1352,
+          "idle_cycles": 1005,
+          "avg_util_pct": 57.3
+        },
+        "store": {
+          "slots_used": 64,
+          "active_cycles": 32,
+          "idle_cycles": 2325,
+          "avg_util_pct": 1.4
+        },
+        "flow": {
+          "slots_used": 2,
+          "active_cycles": 2,
+          "idle_cycles": 2355,
+          "avg_util_pct": 0.1
+        }
+      },
+      "primary_bottleneck": "valu engine is the tightest at 71.8% utilization with only 319 idle cycles. load engine has 1005 idle cycles suggesting further scheduling opportunities. store engine remains heavily underutilized (2325 idle cycles, 1.4% util) despite this round's improvement injecting stores into hextet tail."
+    },
+    {
+      "type": "merged",
+      "attempt_id": "014",
+      "timestamp": "2026-04-12T00:10:00.000000",
+      "commit": "4eb15e6",
+      "new_best": 2357
     }
   ]
 }

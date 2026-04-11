@@ -16,9 +16,61 @@
 | addr 预取 + intra-hextet 流水线 | 2,638 | 56.0x |
 | per-group addr scalars + noload xor pipeline | 2,580 | 57.3x |
 | setup batching + mod0 xor injection | 2,555 | 57.8x |
-| **8-pair 并行 hash+idx (Round 12)** | **2,396** | **61.7x** |
+| 8-pair 并行 hash+idx (Round 12) | 2,396 | 61.7x |
+| cross-round prefetch + store addr elim (Round 13) | 2,385 | 61.9x |
+| **store overlap with hextet tail (Round 14)** | **2,357** | **62.7x** |
 
 通过测试：所有 < 147734 及 < 18532 及 baseline_updated，但未通过 < 2164（需继续优化）
+
+---
+
+## Round 14: store overlap with hextet tail (2026-04-11)
+
+- **Before**: 2385 cycles
+- **After**: 2357 cycles
+- **Improvement**: -1.17%
+- **Technique**: Inject final-round stores into hextet tail bundles (store engine idle during tail phase), overlapping stores with valu ops to save cycles
+- **Commit**: 4eb15e6
+
+### Trace Analysis (winner: 014c)
+| Engine | Util% | Idle Cycles |
+|--------|-------|-------------|
+| alu    | 0.3%  | 2349 |
+| valu   | 71.8% | 319 |
+| load   | 57.3% | 1005 |
+| store  | 1.4%  | 2325 |
+| flow   | 0.1%  | 2355 |
+
+Primary bottleneck: valu engine (71.8% utilization, 319 idle cycles) is the tightest constraint. Load engine has 1005 idle cycles suggesting further load scheduling opportunities. Store engine remains heavily underutilized (2325 idle cycles) despite this round's improvement.
+
+---
+
+## Round 13: cross-round prefetch + store addr elim (2026-04-11)
+
+- 候选 013（cross-round prefetch during mod0 + store phase addr elim）: **2,385 cycles** — ACCEPT，merged（commit 2c9d260）
+- 改进：2,396 → 2,385 cycles（0.46% 降低，61.9x over baseline）
+
+### 013 技术细节
+- **cross-round prefetch**：在 mod0 处理阶段，预取后续 round 所需的 store 地址，减少 load 引擎的 idle gap
+- **store addr elim**：优化 store 阶段的地址计算，减少 alu 开销
+
+### Round 13 引擎利用率（精确 trace 测量）
+| 引擎 | 总 slots | 活跃 cycles | 空闲 cycles | 利用率 |
+|------|---------|-------------|-------------|--------|
+| alu | 76 | 8 | 2,377 | 0.3% |
+| valu | 10,150 | 2,037 | 348 | 70.9% |
+| load | 2,700 | 1,352 | 1,033 | 56.6% |
+| store | 64 | 32 | 2,353 | 1.3% |
+| flow | 2 | 2 | 2,383 | 0.1% |
+
+### 主要瓶颈分析
+- **load 引擎**：1,033 idle cycles（56.6% 利用率）仍是最大优化空间
+- **valu 引擎**：348 idle cycles（70.9% 利用率），次要瓶颈
+- 与 Round 12 相比：load idle 从 1,044 → 1,033（减少 11c），小幅改进
+
+### 理论下界
+- valu ops: 10,150 → min cycles = ⌈10,150/6⌉ = 1,692
+- 当前差距：2,385 − 1,692 = **693 cycles**
 
 ---
 
