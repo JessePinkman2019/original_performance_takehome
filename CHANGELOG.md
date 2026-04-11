@@ -15,9 +15,41 @@
 | hextet 跨边界 tail/head 重叠 | 2,668 | 55.4x |
 | addr 预取 + intra-hextet 流水线 | 2,638 | 56.0x |
 | per-group addr scalars + noload xor pipeline | 2,580 | 57.3x |
-| **setup batching + mod0 xor injection** | **2,555** | **57.8x** |
+| setup batching + mod0 xor injection | 2,555 | 57.8x |
+| **8-pair 并行 hash+idx (Round 12)** | **2,396** | **61.7x** |
 
 通过测试：所有 < 147734 及 < 18532 及 baseline_updated，但未通过 < 2164（需继续优化）
+
+---
+
+## Round 12: 8-pair 并行 hash+idx (2026-04-10)
+
+- 候选 012a（8-pair parallel hash+idx）: **2,396 cycles** — ACCEPT，merged（commit 367f3d9）
+- 候选 012b（E-loads 提前注入 + mod1 setup inline）: **2,537 cycles** — REJECT
+- 候选 012c（arith4 禁用）: **2,521 cycles** — REJECT（禁用 arith4 反而更慢）
+- 改进：2,555 → 2,396 cycles（6.2% 降低，61.7x over baseline）
+
+### 012a 技术细节
+- **8-pair 并行 hash+idx**：将 8 个 group pair 的 hash 和 idx 更新操作并行化，parallel octet 重构
+- 重构 emit_hextet 使 8 组的 hash 计算与另外 8 组的 idx_update 真正重叠
+
+### Round 12 引擎利用率（精确 trace 测量）
+| 引擎 | 总 slots | 活跃 cycles | 空闲 cycles | 利用率 |
+|------|---------|-------------|-------------|--------|
+| alu | 140 | 16 | 2,380 | 0.5% |
+| valu | 10,150 | 2,041 | 355 | 70.6% |
+| load | 2,700 | 1,352 | 1,044 | 56.3% |
+| store | 64 | 32 | 2,364 | 1.3% |
+| flow | 2 | 2 | 2,394 | 0.1% |
+
+### Fusion 分析
+012c 的"修复"是将 `elif round_mod == 2:` 改为 `elif round_mod == 2 and False:`（禁用 arith4），
+但实测结果 2,521 > 2,396，说明 012a 保留 arith4 路径更优。无需 fusion。
+
+### 理论下界（更新）
+- valu ops: 10,150 → min cycles = ⌈10,150/6⌉ = 1,692
+- 当前差距：2,396 − 1,692 = **704 cycles**（valu 355 idle + load 1,044 idle 是主要来源）
+- **load 仍有 1,044 idle cycles** 是最大可优化空间
 
 ---
 

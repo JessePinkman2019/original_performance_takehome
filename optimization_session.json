@@ -4,10 +4,10 @@
   "target_cycles": 1487,
   "stretch_target": 1363,
   "current_best": {
-    "cycles": 2555,
-    "commit": "e72876a",
-    "technique": "setup_batching_plus_mod0_xor_injection",
-    "speedup_over_original_baseline": 57.82
+    "cycles": 2396,
+    "commit": "367f3d9",
+    "technique": "8pair_parallel_hash_idx_round12",
+    "speedup_over_original_baseline": 61.66
   },
   "known_bottlenecks": {
     "load": "8× load_offset per group → 4 cycles (load×2 slot limit)",
@@ -848,6 +848,147 @@
       "attempt_id": "011",
       "commit": "e72876a",
       "new_best": 2555
+    },
+    {
+      "type": "planner_decision",
+      "attempt_id": "012",
+      "timestamp": "2026-04-11T18:43:22.829824",
+      "technique": "divergent_exploration_3way",
+      "trigger": "plateau: Round 8-11 all < 2.2%",
+      "vm_study": "Planner read frozen_problem.py and perf_takehome.py in full",
+      "reasoning": "Three independent insights from source analysis:\n\n1. DEAD SCRATCH (Direction A): lsb_tmp_pair[0..3] and cmp_tmp_pair[0..3] are allocated (64 words) but NEVER USED — Round 011 replaced them with addr_tmp_g[g] reuse. These 64 freed words enable doubling hash temp pairs from 4 to 8, eliminating pair contention between groups A-D and E-H within each hextet. Hash phase serial depth cuts from 40 to 20 cycles per hextet.\n\n2. LOAD WASTE (Direction B): Round 010 trace showed 52.3% LOAD utilization — load engine is idle 47.7% of cycles despite being the throughput bottleneck. With 128 load_offset ops per hextet needing 64 cycles at 2/cycle, but taking ~122 cycles, there are ~58 wasted load-slot-cycles per hextet. Load ops from different groups are always independent, so a bulk-addr-then-bulk-load emission order should saturate the load engine.\n\n3. TREE DEPTH PATTERN (Direction C): The tree height=7 means all depth-7 elements wrap to root after traversal. Round 8 is IDENTICAL to round 0 in tree access pattern, rounds 9,10 identical to 1,2. But code uses rnd%11 not rnd%8, sending rounds 8,9,10 down the slow full-load path. Fix this AND add round 3 special case: round 3 always accesses exactly 8 nodes (7-14 = VLEN), enabling a single vload instruction to fetch all needed values.\n\nMost promising: Direction A (doubled pairs) — directly attacks the identified serialization bottleneck with a concrete mechanism. Direction B (bulk load) directly attacks the measured 52.3% LOAD waste."
+    },
+    {
+      "type": "generator_started",
+      "attempt_id": "012b",
+      "timestamp": "2026-04-11T18:45:42.397814",
+      "worktree": ".claude/worktrees/attempt-012b"
+    },
+    {
+      "type": "generator_started",
+      "attempt_id": "012a",
+      "timestamp": "2026-04-11T18:45:53.734472",
+      "worktree": ".claude/worktrees/attempt-012a"
+    },
+    {
+      "type": "generator_started",
+      "attempt_id": "012c",
+      "timestamp": "2026-04-11T18:46:46.837761",
+      "worktree": ".claude/worktrees/attempt-012c"
+    },
+    {
+      "type": "generator_done",
+      "attempt_id": "012c",
+      "timestamp": "2026-04-11T19:00:58.286287",
+      "cycles": 2521,
+      "improvement": 34,
+      "correct": true,
+      "worktree": ".claude/worktrees/attempt-012c",
+      "summary": "Disabled arith4 path for round_mod==2 (was 174 cycles, now 157 cycles normal path). Added prefetch support to emit_hextet_vselect2 so round_mod==1 hextets prefetch round_mod==2 loads. Result: 34 cycle improvement (2555->2521)."
+    },
+    {
+      "type": "generator_done",
+      "attempt_id": "012b",
+      "timestamp": "2026-04-11T19:25:17.520852",
+      "worktree": ".claude/worktrees/attempt-012b",
+      "cycles": 2537,
+      "baseline": 2555,
+      "improvement": 18,
+      "improvement_pct": 0.71,
+      "status": "success",
+      "optimizations": [
+        "e_loads_early_injection (hextet1 d_preloaded path)",
+        "mod1_inline_prefetch into mod0 noload hextet idle slots"
+      ],
+      "finding": "batch_addr does NOT help; diagonal interleaving already optimal. Actual savings from filling specific idle engine slots."
+    },
+    {
+      "type": "generator_done",
+      "attempt_id": "012a",
+      "timestamp": "2026-04-11T19:46:06.110237",
+      "cycles": 2396,
+      "baseline": 2555,
+      "improvement": 159,
+      "status": "completed"
+    },
+    {
+      "type": "evaluator_result",
+      "attempt_id": "012b",
+      "timestamp": "2026-04-11T19:51:08.703748",
+      "cycles_before": 2555,
+      "cycles_after": 2537,
+      "improvement_pct": 0.7,
+      "passed": false,
+      "unique_contribution": "E-loads 提前注入 + mod1 setup inline，实测 2537 cycles",
+      "decision": "REJECT (012a better)"
+    },
+    {
+      "type": "evaluator_result",
+      "attempt_id": "012c",
+      "timestamp": "2026-04-11T19:51:08.703748",
+      "cycles_before": 2555,
+      "cycles_after": 2521,
+      "improvement_pct": 1.33,
+      "passed": false,
+      "unique_contribution": "arith4 path disabled (round_mod==2 and False), 实测 2521 cycles",
+      "decision": "REJECT (arith4 disable actually slower than 012a which keeps arith4)"
+    },
+    {
+      "type": "evaluator_result",
+      "attempt_id": "012a",
+      "timestamp": "2026-04-11T19:51:08.703748",
+      "cycles_before": 2555,
+      "cycles_after": 2396,
+      "improvement_pct": 6.22,
+      "passed": true,
+      "factual_analysis": {
+        "trace_total_cycles": 2396,
+        "engine_utilization": {
+          "alu": {
+            "slots_used": 140,
+            "active_cycles": 16,
+            "idle_cycles": 2380,
+            "avg_util_pct": 0.5
+          },
+          "valu": {
+            "slots_used": 10150,
+            "active_cycles": 2041,
+            "idle_cycles": 355,
+            "avg_util_pct": 70.6
+          },
+          "load": {
+            "slots_used": 2700,
+            "active_cycles": 1352,
+            "idle_cycles": 1044,
+            "avg_util_pct": 56.3
+          },
+          "store": {
+            "slots_used": 64,
+            "active_cycles": 32,
+            "idle_cycles": 2364,
+            "avg_util_pct": 1.3
+          },
+          "flow": {
+            "slots_used": 2,
+            "active_cycles": 2,
+            "idle_cycles": 2394,
+            "avg_util_pct": 0.1
+          }
+        },
+        "bottleneck": "valu (70.6% utilization, 355 idle cycles vs 1044 load idle) — valu still dominant",
+        "fusion_decision": "No fusion needed: 012c disabled arith4 (round_mod==2 and False) which made it slower (2521 vs 2396). 012a keeps arith4 active and wins."
+      },
+      "unique_contribution": "8-pair 并行 hash+idx，parallel octet 重构，2555→2396 cycles",
+      "selected_winner": true,
+      "decision": "ACCEPT — merged as 367f3d9"
+    },
+    {
+      "type": "merged",
+      "attempt_id": "012a",
+      "timestamp": "2026-04-11T19:51:08.703748",
+      "commit": "367f3d9",
+      "new_best": 2396,
+      "speedup_over_original_baseline": 61.66
     }
   ]
 }
